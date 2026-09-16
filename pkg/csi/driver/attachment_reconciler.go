@@ -101,12 +101,26 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 
 	pvByName := make(map[string]*corev1.PersistentVolume, len(pvList.Items))
 	pvByHandle := make(map[string]*corev1.PersistentVolume, len(pvList.Items))
+	driverName := r.driverName()
 	for idx := range pvList.Items {
 		pv := &pvList.Items[idx]
-		pvByName[pv.Name] = pv
-		if pv.Spec.CSI != nil {
-			pvByHandle[pv.Spec.CSI.VolumeHandle] = pv
+		// @why: index ONLY this driver's PVs. Every consumer below resolves a
+		//   VolumeAttachment through these two maps and skips when the PV is
+		//   nil, so filtering once here is what stops another driver's
+		//   attachment being classified as stale and deleted. Guarding on
+		//   `pv.Spec.CSI != nil` alone let every other CSI driver's PV through:
+		//   its volume handle is never among OpenNebula's observed attachments,
+		//   so the stale-VA loop below deleted it. That detached live volumes
+		//   from running pods.
+		// @gotcha: compare against the INSTANCE's name, not DefaultDriverName —
+		//   the name is configurable (DriverOptions.DriverName), and a
+		//   deployment using a custom one would otherwise filter out its own
+		//   volumes and silently reconcile nothing.
+		if pv.Spec.CSI == nil || strings.TrimSpace(pv.Spec.CSI.Driver) != driverName {
+			continue
 		}
+		pvByName[pv.Name] = pv
+		pvByHandle[pv.Spec.CSI.VolumeHandle] = pv
 	}
 
 	activePVCUsers := make(map[string]bool)
@@ -244,6 +258,17 @@ func (r *AttachmentReconciler) ReconcileOnce(ctx context.Context) error {
 	r.prune(r.divergentSeen, currentDivergent)
 	r.prune(r.multiAttachSeen, currentMultiAttach)
 	return nil
+}
+
+// driverName returns this driver instance's CSI name, falling back to the
+// package default when the reconciler is not fully wired (as in unit tests).
+func (r *AttachmentReconciler) driverName() string {
+	if r != nil && r.server != nil && r.server.driver != nil {
+		if name := strings.TrimSpace(r.server.driver.name); name != "" {
+			return name
+		}
+	}
+	return DefaultDriverName
 }
 
 func (r *AttachmentReconciler) skipVolume(volumeHandle string) bool {
