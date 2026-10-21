@@ -267,7 +267,7 @@ func (ns *NodeServer) evaluateLocalDiskPath(volumeID, path string) (localDiskMou
 	if mountPoint.Device == "" {
 		return localDiskMountHealth{Stale: true, Reason: "missing_mount_source", Message: "mount point has no source device"}, nil
 	}
-	if strings.HasPrefix(mountPoint.Device, "/dev/") {
+	if strings.HasPrefix(mountPoint.Device, filepath.Clean(defaultDiskPath)+"/") {
 		if _, err := nodeVolumePathStat(mountPoint.Device); err != nil {
 			if os.IsNotExist(err) || isStaleLocalDiskPathError(err) {
 				return localDiskMountHealth{Stale: true, Reason: "source_missing", MountSource: mountPoint.Device, Message: err.Error()}, nil
@@ -275,7 +275,7 @@ func (ns *NodeServer) evaluateLocalDiskPath(volumeID, path string) (localDiskMou
 			return localDiskMountHealth{}, err
 		}
 		if session, exists, loadErr := ns.loadLocalDiskSession(volumeID); loadErr == nil && exists && session.DeviceSerial != "" {
-			if !deviceMatchesSerial(ns.mounter.Exec, mountPoint.Device, session.DeviceSerial, "") {
+			if !deviceMatchesSerial(ns.mounter.Exec, mountPoint.Device, session.DeviceSerial) {
 				return localDiskMountHealth{Stale: true, Reason: "serial_mismatch", MountSource: mountPoint.Device, Message: "mount source serial does not match expected volume serial"}, nil
 			}
 		}
@@ -385,7 +385,7 @@ func (ns *NodeServer) resolveLocalDiskRecoveryDevice(ctx context.Context, sessio
 	if err != nil {
 		return "", err
 	}
-	if session.DeviceSerial != "" && !deviceMatchesSerial(ns.mounter.Exec, devicePath, session.DeviceSerial, "") {
+	if session.DeviceSerial != "" && !deviceMatchesSerial(ns.mounter.Exec, devicePath, session.DeviceSerial) {
 		return "", fmt.Errorf("resolved device %s does not match expected serial %s", devicePath, session.DeviceSerial)
 	}
 	return devicePath, nil

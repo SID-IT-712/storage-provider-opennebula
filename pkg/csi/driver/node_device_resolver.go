@@ -20,8 +20,8 @@ var (
 	nodeByIDGlob      = filepath.Glob
 	nodeEvalSymlinks  = filepath.EvalSymlinks
 	nodeWriteFile     = os.WriteFile
-	nodeReadlink      = os.Readlink
 	nodeReadDir       = os.ReadDir
+	nodeSysfsRoot     = "/sys"
 	deviceResolverNow = func() time.Time { return time.Now() }
 )
 
@@ -89,14 +89,14 @@ func (r *NodeDeviceResolver) Resolve(ctx context.Context, volumeID, volumeName s
 		}
 	}
 
+	// @gotcha: a request with a serial never resolves by alias. volumeName is OpenNebula's
+	//   disk TARGET, not the kernel name: /dev/<TARGET> can be another volume's disk.
 	if serial != "" {
 		if path, ok := r.resolveByID(serial); ok {
 			r.remember(volumeID, imageID, serial, path.DevicePath, path.ByIDPath)
 			return path.DevicePath, deviceResolutionResult{ResolvedBy: "by-id", Latency: deviceResolverNow().Sub(started)}, nil
 		}
-	}
-
-	if devicePath, result, err := r.resolveAlias(volumeName, started); err == nil {
+	} else if devicePath, result, err := r.resolveAlias(volumeName, started); err == nil {
 		r.remember(volumeID, imageID, serial, devicePath, "")
 		return devicePath, result, nil
 	}
@@ -112,8 +112,7 @@ func (r *NodeDeviceResolver) Resolve(ctx context.Context, volumeID, volumeName s
 				r.remember(volumeID, imageID, serial, path.DevicePath, path.ByIDPath)
 				return path.DevicePath, deviceResolutionResult{ResolvedBy: "by-id-recovery", Latency: deviceResolverNow().Sub(started)}, nil
 			}
-		}
-		if devicePath, result, err := r.resolveAlias(volumeName, started); err == nil {
+		} else if devicePath, result, err := r.resolveAlias(volumeName, started); err == nil {
 			r.remember(volumeID, imageID, serial, devicePath, "")
 			if result.ResolvedBy == "exact" {
 				result.ResolvedBy = "exact-recovery"
@@ -179,7 +178,7 @@ func (r *NodeDeviceResolver) resolveFromCache(volumeID, serial string) (resolved
 		return resolvedDevicePath{}, false
 	}
 	if serial != "" {
-		if !deviceMatchesSerial(r.exec, entry.DevicePath, serial, entry.ByIDPath) {
+		if !deviceMatchesSerial(r.exec, entry.DevicePath, serial) {
 			r.Invalidate(volumeID)
 			return resolvedDevicePath{}, false
 		}
@@ -196,8 +195,7 @@ func (r *NodeDeviceResolver) resolveByID(serial string) (resolvedDevicePath, boo
 		return resolvedDevicePath{}, false
 	}
 	for _, candidate := range candidates {
-		base := filepath.Base(candidate)
-		if !strings.Contains(strings.ToLower(base), strings.ToLower(serial)) {
+		if !byIDNameHasSerial(filepath.Base(candidate), serial) {
 			continue
 		}
 		resolved, err := nodeEvalSymlinks(candidate)
@@ -207,11 +205,29 @@ func (r *NodeDeviceResolver) resolveByID(serial string) (resolvedDevicePath, boo
 		if _, err := nodeVolumePathStat(resolved); err != nil {
 			continue
 		}
-		if deviceMatchesSerial(r.exec, resolved, serial, candidate) {
-			return resolvedDevicePath{DevicePath: resolved, ByIDPath: candidate}, true
+		// An exact by-id name is accepted when no source knows the device's
+		// serial; a source that knows it and disagrees vetoes the candidate.
+		if deviceSerialEvidenceFor(r.exec, resolved, serial) == serialMismatch {
+			klog.V(2).InfoS("Skipping by-id candidate whose device reports another serial",
+				"candidate", candidate, "device", resolved, "serial", serial)
+			continue
 		}
+		return resolvedDevicePath{DevicePath: resolved, ByIDPath: candidate}, true
 	}
 	return resolvedDevicePath{}, false
+}
+
+// byIDNameHasSerial reports whether a /dev/disk/by-id entry name names the
+// serial as a whole trailing token: the name equals the serial or ends with
+// "_"+serial or "-"+serial (case-insensitive).
+// @gotcha: never a substring match - onecsi-43 is a substring of onecsi-439.
+func byIDNameHasSerial(base, serial string) bool {
+	base = strings.ToLower(strings.TrimSpace(base))
+	serial = strings.ToLower(strings.TrimSpace(serial))
+	if serial == "" || base == "" {
+		return false
+	}
+	return base == serial || strings.HasSuffix(base, "_"+serial) || strings.HasSuffix(base, "-"+serial)
 }
 
 func (r *NodeDeviceResolver) resolveAlias(volumeName string, started time.Time) (string, deviceResolutionResult, error) {
@@ -303,36 +319,119 @@ func (r *NodeDeviceResolver) remember(volumeID, imageID, serial, devicePath, byI
 	r.mu.Unlock()
 }
 
-func deviceMatchesSerial(exec utilexec.Interface, devicePath, serial, byIDPath string) bool {
+type serialEvidence int
+
+const (
+	serialUnknown serialEvidence = iota
+	serialMatch
+	serialMismatch
+)
+
+// deviceMatchesSerial reports whether the block device at devicePath carries
+// serial. It fails closed: when no source knows the device's serial it is
+// false. Sources, in order: the kernel (sysfs), udevadm, lsblk; every compare
+// is exact (case-insensitive).
+// @gotcha: the node plugin container has no udev db, so udevadm/lsblk report no serial
+// there; the kernel sysfs serial is the primary proof. Never reintroduce substring matching.
+func deviceMatchesSerial(exec utilexec.Interface, devicePath, serial string) bool {
+	if strings.TrimSpace(serial) == "" {
+		return true
+	}
+	return deviceSerialEvidenceFor(exec, devicePath, serial) == serialMatch
+}
+
+// deviceSerialEvidenceFor says whether the device affirmatively carries
+// serial, affirmatively carries another one, or whether no source knows.
+func deviceSerialEvidenceFor(exec utilexec.Interface, devicePath, serial string) serialEvidence {
 	serial = strings.TrimSpace(serial)
-	if serial == "" {
-		return true
+	kernelSerial, err := kernelDeviceSerial(devicePath)
+	if err != nil {
+		klog.V(4).InfoS("Kernel device serial unavailable", "device", devicePath, "err", err)
 	}
-	if exec != nil {
-		if output, err := exec.Command("udevadm", "info", "--query=property", "--name", devicePath).CombinedOutput(); err == nil {
-			for _, line := range strings.Split(string(output), "\n") {
-				if strings.HasPrefix(line, "ID_SERIAL=") || strings.HasPrefix(line, "ID_SERIAL_SHORT=") {
-					parts := strings.SplitN(line, "=", 2)
-					if len(parts) == 2 && strings.EqualFold(strings.TrimSpace(parts[1]), serial) {
-						return true
-					}
-				}
+	if kernelSerial != "" {
+		if strings.EqualFold(kernelSerial, serial) {
+			return serialMatch
+		}
+		return serialMismatch
+	}
+	if exec == nil {
+		return serialUnknown
+	}
+	known := false
+	if output, err := exec.Command("udevadm", "info", "--query=property", "--name", devicePath).CombinedOutput(); err == nil {
+		for _, line := range strings.Split(string(output), "\n") {
+			if !strings.HasPrefix(line, "ID_SERIAL=") && !strings.HasPrefix(line, "ID_SERIAL_SHORT=") {
+				continue
+			}
+			value := strings.TrimSpace(strings.SplitN(line, "=", 2)[1])
+			if value == "" {
+				continue
+			}
+			known = true
+			if strings.EqualFold(value, serial) {
+				return serialMatch
 			}
 		}
-		if output, err := exec.Command("lsblk", "-ndo", "SERIAL", devicePath).CombinedOutput(); err == nil {
-			if strings.EqualFold(strings.TrimSpace(string(output)), serial) {
-				return true
+	}
+	if output, err := exec.Command("lsblk", "-ndo", "SERIAL", devicePath).CombinedOutput(); err == nil {
+		if value := strings.TrimSpace(string(output)); value != "" {
+			known = true
+			if strings.EqualFold(value, serial) {
+				return serialMatch
 			}
 		}
 	}
-	if strings.TrimSpace(byIDPath) != "" && strings.Contains(strings.ToLower(filepath.Base(byIDPath)), strings.ToLower(serial)) {
-		return true
+	if known {
+		return serialMismatch
 	}
-	linkTarget, err := nodeReadlink(devicePath)
-	if err == nil && strings.Contains(strings.ToLower(linkTarget), strings.ToLower(serial)) {
-		return true
+	return serialUnknown
+}
+
+// kernelDeviceSerial reads a whole disk's serial from the kernel's sysfs: the
+// SCSI unit serial number VPD page (0x80), else the virtio-blk serial. It
+// returns "" with no error when the kernel exposes neither, or when the path
+// is not a whole disk (a partition has no <sysfs>/block/<name>).
+func kernelDeviceSerial(devicePath string) (string, error) {
+	resolved, err := nodeEvalSymlinks(devicePath)
+	if err != nil {
+		return "", err
 	}
-	return false
+	blockDir := filepath.Join(nodeSysfsRoot, "block", filepath.Base(resolved))
+	if _, err := os.Stat(blockDir); err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	if raw, err := os.ReadFile(filepath.Join(blockDir, "device", "vpd_pg80")); err == nil {
+		if serial := parseVPDPage80(raw); serial != "" {
+			return serial, nil
+		}
+	}
+	if raw, err := os.ReadFile(filepath.Join(blockDir, "serial")); err == nil {
+		if serial := trimDeviceSerial(string(raw)); serial != "" {
+			return serial, nil
+		}
+	}
+	return "", nil
+}
+
+// parseVPDPage80 extracts the serial from an SPC Unit Serial Number VPD page:
+// byte 1 is the page code (0x80), bytes 2-3 the big-endian page length, and the
+// serial follows from byte 4. A malformed page yields "".
+func parseVPDPage80(raw []byte) string {
+	if len(raw) < 4 || raw[1] != 0x80 {
+		return ""
+	}
+	length := int(raw[2])<<8 | int(raw[3])
+	if 4+length > len(raw) {
+		return ""
+	}
+	return trimDeviceSerial(string(raw[4 : 4+length]))
+}
+
+func trimDeviceSerial(value string) string {
+	return strings.Trim(value, " \t\r\n\x00")
 }
 
 func pathJoin(parts ...string) string {
