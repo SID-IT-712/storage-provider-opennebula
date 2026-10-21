@@ -37,7 +37,7 @@ func TestNodeDeviceResolverPrefersByIDAndThenCache(t *testing.T) {
 	}, time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, resolvedDevicePath, path)
-	assert.Equal(t, "by-id", resolution.ResolvedBy)
+	assert.Equal(t, "kernel-serial", resolution.ResolvedBy)
 
 	require.NoError(t, os.Remove(byIDPath))
 	path, resolution, err = resolver.Resolve(context.Background(), "vol-1", "sde", map[string]string{
@@ -65,12 +65,12 @@ func TestNodeDeviceResolverInvalidatesCacheOnSerialMismatch(t *testing.T) {
 	resolver := NewNodeDeviceResolver(pluginConfig, nil, func(string) []string {
 		return []string{newDevicePath}
 	})
-	resolver.remember("vol-1", "42", "onecsi-42", oldDevicePath, filepath.Join(diskPath, "disk", "by-id", "virtio-onecsi-42"))
+	resolver.remember("vol-1", "42", "onecsi-42", located{DevicePath: oldDevicePath, ByIDPath: filepath.Join(diskPath, "disk", "by-id", "virtio-onecsi-42")})
 
 	path, resolution, err := resolver.Resolve(context.Background(), "vol-1", "sde", map[string]string{
 		publishContextDeviceSerial: "onecsi-43",
 	}, time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, newDevicePath, path)
-	assert.Equal(t, "by-id", resolution.ResolvedBy)
+	assert.Equal(t, "kernel-serial", resolution.ResolvedBy)
 }
