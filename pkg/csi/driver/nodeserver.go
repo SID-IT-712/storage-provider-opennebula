@@ -168,12 +168,9 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	klog.V(2).InfoS("Resolved staged device path",
 		"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath, "deviceDiscoveryTimeout", deviceTimeout,
 		"resolvedBy", resolution.ResolvedBy, "resolutionLatency", resolution.Latency)
-	// @gotcha: the identity guard. It runs before any mount-point check or FormatAndMount,
-	//   whatever path resolution took, so a disk without the requested serial is never formatted or mounted.
-	if serial := strings.TrimSpace(volumeContext[publishContextDeviceSerial]); serial != "" && !deviceMatchesSerial(ns.mounter.Exec, devicePath, serial) {
-		klog.V(0).ErrorS(nil, "Resolved device does not carry the requested serial",
-			"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath, "serial", serial, "resolvedBy", resolution.ResolvedBy)
-		return nil, status.Errorf(codes.FailedPrecondition, "resolved device %s does not carry serial %s; refusing to format or mount", devicePath, serial)
+	if err := requireSerialProof(volumeContext, devicePath, resolution); err != nil {
+		klog.V(0).ErrorS(err, "Refusing an unproven device", "method", "NodeStageVolume", "volumeID", volumeID)
+		return nil, err
 	}
 
 	volMount := volumeCapability.GetMount()
@@ -417,6 +414,10 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		klog.V(2).InfoS("Resolved block device path",
 			"method", "NodePublishVolume", "volumeID", volumeID, "devicePath", devicePath, "deviceDiscoveryTimeout", deviceTimeout,
 			"resolvedBy", resolution.ResolvedBy, "resolutionLatency", resolution.Latency)
+		if proofErr := requireSerialProof(volumeContext, devicePath, resolution); proofErr != nil {
+			klog.V(0).ErrorS(proofErr, "Refusing an unproven device", "method", "NodePublishVolume", "volumeID", volumeID)
+			return nil, proofErr
+		}
 		resp, err = ns.handleBlockVolumePublish(devicePath, targetPath, volumeCapability, options)
 	case *csi.VolumeCapability_Mount:
 		resp, err = ns.handleMountVolumePublish(stagingTargetPath, targetPath, volumeCapability, options)
@@ -993,7 +994,22 @@ func (ns *NodeServer) getDeviceName(volumeName string) string {
 
 type deviceResolutionResult struct {
 	ResolvedBy string
-	Latency    time.Duration
+	// Proof is set for a request with a serial: how the device was proven to carry it.
+	Proof   deviceProof
+	Latency time.Duration
+}
+
+// requireSerialProof refuses a device for a request with a serial unless the
+// resolver proved its identity. Consumers trust this proof; they do not
+// re-check identity themselves.
+// @gotcha: this is what makes a wrong-disk format or bind impossible. Never stage or
+// publish a serial request's device without it.
+func requireSerialProof(publishContext map[string]string, devicePath string, resolution deviceResolutionResult) error {
+	serial := strings.TrimSpace(publishContext[publishContextDeviceSerial])
+	if serial == "" || resolution.Proof != "" {
+		return nil
+	}
+	return status.Errorf(codes.FailedPrecondition, "device %s was not proven to carry serial %s; refusing to format, mount or publish it", devicePath, serial)
 }
 
 func (ns *NodeServer) resolveDevicePath(volumeName string, timeout time.Duration) (string, deviceResolutionResult, error) {
@@ -1003,6 +1019,10 @@ func (ns *NodeServer) resolveDevicePath(volumeName string, timeout time.Duration
 func (ns *NodeServer) resolveDevicePathWithContext(volumeID, volumeName string, publishContext map[string]string, timeout time.Duration) (string, deviceResolutionResult, error) {
 	if ns.deviceResolver != nil {
 		return ns.deviceResolver.Resolve(context.Background(), volumeID, volumeName, publishContext, timeout)
+	}
+	if serial := strings.TrimSpace(publishContext[publishContextDeviceSerial]); serial != "" {
+		// Only the resolver can prove a serial; the alias below would guess.
+		return "", deviceResolutionResult{}, fmt.Errorf("no device resolver to locate serial %s for volume %q", serial, volumeName)
 	}
 
 	started := time.Now()

@@ -275,7 +275,7 @@ func (ns *NodeServer) evaluateLocalDiskPath(volumeID, path string) (localDiskMou
 			return localDiskMountHealth{}, err
 		}
 		if session, exists, loadErr := ns.loadLocalDiskSession(volumeID); loadErr == nil && exists && session.DeviceSerial != "" {
-			if !deviceMatchesSerial(ns.mounter.Exec, mountPoint.Device, session.DeviceSerial) {
+			if !ns.mountSourceCarriesSerial(mountPoint.Device, session.DeviceSerial) {
 				return localDiskMountHealth{Stale: true, Reason: "serial_mismatch", MountSource: mountPoint.Device, Message: "mount source serial does not match expected volume serial"}, nil
 			}
 		}
@@ -381,14 +381,29 @@ func (ns *NodeServer) resolveLocalDiskRecoveryDevice(ctx context.Context, sessio
 		volumeName = session.DevicePath
 	}
 	timeout := ns.deviceDiscoveryTimeout(publishContext)
-	devicePath, _, err := ns.deviceResolver.Resolve(ctx, session.VolumeID, volumeName, publishContext, timeout)
+	devicePath, resolution, err := ns.resolveDevicePathWithContext(session.VolumeID, volumeName, publishContext, timeout)
 	if err != nil {
 		return "", err
 	}
-	if session.DeviceSerial != "" && !deviceMatchesSerial(ns.mounter.Exec, devicePath, session.DeviceSerial) {
-		return "", fmt.Errorf("resolved device %s does not match expected serial %s", devicePath, session.DeviceSerial)
+	if err := requireSerialProof(publishContext, devicePath, resolution); err != nil {
+		return "", err
 	}
 	return devicePath, nil
+}
+
+// mountSourceCarriesSerial decides whether an existing mount source is the
+// volume's disk. A source that reports the serial is; one that reports another
+// is not; when no source knows, it is only if it is the same block device that
+// locateBySerial proves for the serial.
+func (ns *NodeServer) mountSourceCarriesSerial(mountSource, serial string) bool {
+	switch identifyDevice(ns.mounter.Exec, mountSource, serial) {
+	case serialMatch:
+		return true
+	case serialMismatch:
+		return false
+	}
+	found, err := locateBySerial(ns.mounter.Exec, serial)
+	return err == nil && found.Proof != "" && sameBlockDevice(mountSource, found.DevicePath)
 }
 
 func (ns *NodeServer) recordLocalDiskRecoveryFailure(session localDiskSession, err error) error {

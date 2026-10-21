@@ -530,25 +530,17 @@ func sharedSessionForVolume(sessions []sharedFilesystemSession, volumeID string)
 	return sharedFilesystemSession{}, false
 }
 
+// resolveByIDForReport reports where the resolver would find serial, through
+// the same locateBySerial the resolver uses.
 func resolveByIDForReport(serial, fallback string) (string, string) {
 	if strings.TrimSpace(serial) == "" {
 		return "", fallback
 	}
-	candidates, err := nodeByIDGlob(filepath.Join(defaultDiskPath, "disk", "by-id", "*"))
+	found, err := locateBySerial(nil, serial)
 	if err != nil {
 		return "", fallback
 	}
-	for _, candidate := range candidates {
-		if !byIDNameHasSerial(filepath.Base(candidate), serial) {
-			continue
-		}
-		resolved, err := nodeEvalSymlinks(candidate)
-		if err != nil {
-			return candidate, fallback
-		}
-		return candidate, resolved
-	}
-	return "", fallback
+	return found.ByIDPath, found.DevicePath
 }
 
 func classifyVolumeHealthReport(report VolumeHealthReport) (string, string, string) {
