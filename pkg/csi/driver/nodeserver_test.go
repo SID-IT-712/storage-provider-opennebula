@@ -173,9 +173,13 @@ func TestStageVolume(t *testing.T) {
 
 func TestStageVolumeKeepsLocalDeviceReportUntilMountSucceeds(t *testing.T) {
 	tempDir := t.TempDir()
+	sysfs := withTestSysfs(t)
 	diskPath := withTestDiskPath(t)
 	err := os.WriteFile(filepath.Join(diskPath, "sdd"), []byte("test"), 0o644)
 	assert.NoError(t, err)
+	// a serial request resolves only through by-id and must prove its serial
+	writeSysfsVPD80(t, sysfs, "sdd", vpdPage80("onecsi-439"))
+	linkByID(t, diskPath, "scsi-0QEMU_QEMU_HARDDISK_onecsi-439", "sdd")
 
 	pluginConfig := config.LoadConfiguration()
 	pluginConfig.OverrideVal(config.LocalDeviceRecoveryEnabledVar, true)

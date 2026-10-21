@@ -13,7 +13,9 @@ import (
 )
 
 func TestNodeDeviceResolverPrefersByIDAndThenCache(t *testing.T) {
+	sysfs := withTestSysfs(t)
 	diskPath := withTestDiskPath(t)
+	writeSysfsSerial(t, sysfs, "vde", "onecsi-42")
 	require.NoError(t, os.MkdirAll(filepath.Join(diskPath, "disk", "by-id"), 0o755))
 	devicePath := filepath.Join(diskPath, "vde")
 	require.NoError(t, os.WriteFile(devicePath, []byte("test"), 0o644))
@@ -48,15 +50,14 @@ func TestNodeDeviceResolverPrefersByIDAndThenCache(t *testing.T) {
 }
 
 func TestNodeDeviceResolverInvalidatesCacheOnSerialMismatch(t *testing.T) {
+	sysfs := withTestSysfs(t)
 	diskPath := withTestDiskPath(t)
-	originalReadlink := nodeReadlink
-	nodeReadlink = func(name string) (string, error) { return "", os.ErrNotExist }
-	t.Cleanup(func() { nodeReadlink = originalReadlink })
 
 	oldDevicePath := filepath.Join(diskPath, "vde")
 	require.NoError(t, os.WriteFile(oldDevicePath, []byte("test"), 0o644))
-	newDevicePath := filepath.Join(diskPath, "sde")
-	require.NoError(t, os.WriteFile(newDevicePath, []byte("test"), 0o644))
+	newDevicePath := writeDisk(t, diskPath, "sde")
+	writeSysfsVPD80(t, sysfs, "sde", vpdPage80("onecsi-43"))
+	linkByID(t, diskPath, "scsi-0QEMU_QEMU_HARDDISK_onecsi-43", "sde")
 
 	pluginConfig := config.LoadConfiguration()
 	pluginConfig.OverrideVal(config.NodeDeviceRescanOnMissEnabledVar, false)
@@ -71,5 +72,5 @@ func TestNodeDeviceResolverInvalidatesCacheOnSerialMismatch(t *testing.T) {
 	}, time.Second)
 	require.NoError(t, err)
 	assert.Equal(t, newDevicePath, path)
-	assert.Equal(t, "exact", resolution.ResolvedBy)
+	assert.Equal(t, "by-id", resolution.ResolvedBy)
 }

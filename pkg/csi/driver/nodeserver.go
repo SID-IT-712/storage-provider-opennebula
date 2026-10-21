@@ -168,6 +168,13 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	klog.V(2).InfoS("Resolved staged device path",
 		"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath, "deviceDiscoveryTimeout", deviceTimeout,
 		"resolvedBy", resolution.ResolvedBy, "resolutionLatency", resolution.Latency)
+	// @gotcha: the identity guard. It runs before any mount-point check or FormatAndMount,
+	//   whatever path resolution took, so a disk without the requested serial is never formatted or mounted.
+	if serial := strings.TrimSpace(volumeContext[publishContextDeviceSerial]); serial != "" && !deviceMatchesSerial(ns.mounter.Exec, devicePath, serial) {
+		klog.V(0).ErrorS(nil, "Resolved device does not carry the requested serial",
+			"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath, "serial", serial, "resolvedBy", resolution.ResolvedBy)
+		return nil, status.Errorf(codes.FailedPrecondition, "resolved device %s does not carry serial %s; refusing to format or mount", devicePath, serial)
+	}
 
 	volMount := volumeCapability.GetMount()
 	mountFlags := volMount.GetMountFlags()

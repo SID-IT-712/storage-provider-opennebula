@@ -539,7 +539,7 @@ func resolveByIDForReport(serial, fallback string) (string, string) {
 		return "", fallback
 	}
 	for _, candidate := range candidates {
-		if !strings.Contains(strings.ToLower(filepath.Base(candidate)), strings.ToLower(serial)) {
+		if !byIDNameHasSerial(filepath.Base(candidate), serial) {
 			continue
 		}
 		resolved, err := nodeEvalSymlinks(candidate)
