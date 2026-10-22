@@ -381,7 +381,7 @@ func (ns *NodeServer) resolveLocalDiskRecoveryDevice(ctx context.Context, sessio
 		volumeName = session.DevicePath
 	}
 	timeout := ns.deviceDiscoveryTimeout(publishContext)
-	devicePath, resolution, err := ns.resolveDevicePathWithContext(session.VolumeID, volumeName, publishContext, timeout)
+	devicePath, resolution, err := ns.resolveDevicePathWithContext(ctx, session.VolumeID, volumeName, publishContext, timeout)
 	if err != nil {
 		return "", err
 	}

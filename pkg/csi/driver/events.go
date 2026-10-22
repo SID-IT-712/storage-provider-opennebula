@@ -18,6 +18,7 @@ const (
 	eventReasonHotplugCooldown              = "HotplugCooldown"
 	eventReasonDeviceDiscoverySlow          = "DeviceDiscoverySlow"
 	eventReasonDeviceDiscoveryTimeout       = "DeviceDiscoveryTimeout"
+	eventReasonDeviceIdentityRefused        = "DeviceIdentityRefused"
 	eventReasonDeviceCacheHit               = "DeviceCacheHit"
 	eventReasonDeviceCacheMiss              = "DeviceCacheMiss"
 	eventReasonDeviceByIDResolved           = "DeviceByIDResolved"

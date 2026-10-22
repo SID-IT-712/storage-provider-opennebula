@@ -33,12 +33,13 @@ const (
 	publishContextOpenNebulaImageID = "opennebulaImageID"
 )
 
+// nodeDeviceCacheEntry caches a device for a request WITHOUT a serial. A serial
+// request never uses the cache: locateBySerial is a cheap sysfs read and is the
+// proof itself.
 type nodeDeviceCacheEntry struct {
 	VolumeID        string
 	ImageID         string
-	Serial          string
 	DevicePath      string
-	ByIDPath        string
 	LastConfirmedAt time.Time
 }
 
@@ -87,15 +88,15 @@ func (r *NodeDeviceResolver) Resolve(ctx context.Context, volumeID, volumeName s
 	serial := strings.TrimSpace(publishContext[publishContextDeviceSerial])
 	imageID := strings.TrimSpace(publishContext[publishContextOpenNebulaImageID])
 	if serial != "" {
-		return r.resolveSerial(ctx, volumeID, imageID, serial, started, timeout)
+		return r.resolveSerial(ctx, volumeName, serial, started, timeout)
 	}
 	if volumeID != "" {
-		if path, ok := r.resolveFromCache(volumeID, ""); ok {
-			return path.DevicePath, deviceResolutionResult{ResolvedBy: "cache", Latency: deviceResolverNow().Sub(started)}, nil
+		if devicePath, ok := r.resolveFromCache(volumeID); ok {
+			return devicePath, deviceResolutionResult{ResolvedBy: "cache", Latency: deviceResolverNow().Sub(started)}, nil
 		}
 	}
 	if devicePath, result, err := r.resolveAlias(volumeName, started); err == nil {
-		r.remember(volumeID, imageID, "", located{DevicePath: devicePath})
+		r.remember(volumeID, imageID, devicePath)
 		return devicePath, result, nil
 	}
 
@@ -106,7 +107,7 @@ func (r *NodeDeviceResolver) Resolve(ctx context.Context, volumeID, volumeName s
 		}
 		r.runRecoverySequence(ctx)
 		if devicePath, result, err := r.resolveAlias(volumeName, started); err == nil {
-			r.remember(volumeID, imageID, "", located{DevicePath: devicePath})
+			r.remember(volumeID, imageID, devicePath)
 			if result.ResolvedBy == "exact" {
 				result.ResolvedBy = "exact-recovery"
 			} else {
@@ -127,22 +128,17 @@ func (r *NodeDeviceResolver) Resolve(ctx context.Context, volumeID, volumeName s
 	return "", deviceResolutionResult{}, fmt.Errorf("timed out after %s waiting for device path for volume %q (checked %s)", timeout, volumeName, strings.Join(candidates, ", "))
 }
 
-// resolveSerial resolves a request that carries a device serial. Every result
-// carries the proof that the device is the one with that serial.
+// resolveSerial resolves a request that carries a device serial, through
+// locateBySerial only. Every result carries the proof. Not-found, not-yet and
+// ambiguous are retried until the timeout (a stale twin usually disappears).
 // @gotcha: a request with a serial never resolves by alias. volumeName is OpenNebula's
 // disk TARGET, not the kernel name: /dev/<TARGET> can be another volume's disk.
-func (r *NodeDeviceResolver) resolveSerial(ctx context.Context, volumeID, imageID, serial string, started time.Time, timeout time.Duration) (string, deviceResolutionResult, error) {
-	if volumeID != "" {
-		if path, ok := r.resolveFromCache(volumeID, serial); ok {
-			return path.DevicePath, deviceResolutionResult{ResolvedBy: "cache", Proof: path.Proof, Latency: deviceResolverNow().Sub(started)}, nil
-		}
-	}
+func (r *NodeDeviceResolver) resolveSerial(ctx context.Context, volumeName, serial string, started time.Time, timeout time.Duration) (string, deviceResolutionResult, error) {
 	found, err := locateBySerial(r.exec, serial)
 	if err == nil {
-		r.remember(volumeID, imageID, serial, found)
 		return found.DevicePath, deviceResolutionResult{ResolvedBy: found.resolvedBy(""), Proof: found.Proof, Latency: deviceResolverNow().Sub(started)}, nil
 	}
-	if !errors.Is(err, errSerialNotFound) {
+	if !isRetryableLocateError(err) {
 		return "", deviceResolutionResult{}, err
 	}
 
@@ -151,10 +147,9 @@ func (r *NodeDeviceResolver) resolveSerial(ctx context.Context, volumeID, imageI
 		r.runRecoverySequence(ctx)
 		found, err = locateBySerial(r.exec, serial)
 		if err == nil {
-			r.remember(volumeID, imageID, serial, found)
 			return found.DevicePath, deviceResolutionResult{ResolvedBy: found.resolvedBy("-recovery"), Proof: found.Proof, Latency: deviceResolverNow().Sub(started)}, nil
 		}
-		if !errors.Is(err, errSerialNotFound) {
+		if !isRetryableLocateError(err) {
 			return "", deviceResolutionResult{}, err
 		}
 		if timeout <= 0 {
@@ -162,7 +157,10 @@ func (r *NodeDeviceResolver) resolveSerial(ctx context.Context, volumeID, imageI
 		}
 		nodeDeviceSleep(defaultNodeDevicePollPeriod)
 	}
-	return "", deviceResolutionResult{}, fmt.Errorf("timed out after %s: %w", timeout, serialNotFoundError(serial))
+	return "", deviceResolutionResult{}, &locateError{
+		kind: kindOf(err),
+		msg:  fmt.Sprintf("after %s: %v (TARGET %s is not used for serial requests)", timeout, err, volumeName),
+	}
 }
 
 func (r *NodeDeviceResolver) Invalidate(volumeID string) {
@@ -174,65 +172,46 @@ func (r *NodeDeviceResolver) Invalidate(volumeID string) {
 	r.mu.Unlock()
 }
 
-// resolveFromCache returns a cached device. For a serial request the hit is
-// re-proven: the kernel/udev/lsblk serial must match, or, when no source knows
-// it, locateBySerial must still find the same device.
-func (r *NodeDeviceResolver) resolveFromCache(volumeID, serial string) (located, bool) {
+// resolveFromCache returns a cached device for a request without a serial.
+func (r *NodeDeviceResolver) resolveFromCache(volumeID string) (string, bool) {
 	if r == nil || !r.cacheEnabled || strings.TrimSpace(volumeID) == "" {
-		return located{}, false
+		return "", false
 	}
 	r.mu.RLock()
 	entry, ok := r.cache[volumeID]
 	r.mu.RUnlock()
 	if !ok {
-		return located{}, false
+		return "", false
 	}
 	if r.cacheTTL > 0 && deviceResolverNow().Sub(entry.LastConfirmedAt) > r.cacheTTL {
 		r.Invalidate(volumeID)
-		return located{}, false
-	}
-	if serial != "" && entry.Serial != "" && !strings.EqualFold(strings.TrimSpace(serial), strings.TrimSpace(entry.Serial)) {
-		r.Invalidate(volumeID)
-		return located{}, false
+		return "", false
 	}
 	if entry.DevicePath == "" {
 		r.Invalidate(volumeID)
-		return located{}, false
+		return "", false
 	}
 	if _, err := nodeVolumePathStat(entry.DevicePath); err != nil {
 		r.Invalidate(volumeID)
-		return located{}, false
+		return "", false
 	}
-	hit := located{DevicePath: entry.DevicePath, ByIDPath: entry.ByIDPath}
-	if serial == "" {
-		return hit, true
-	}
-	switch identifyDevice(r.exec, entry.DevicePath, serial) {
-	case serialMatch:
-		hit.Proof = proofKernel
-		return hit, true
-	case serialUnknown:
-		if found, err := locateBySerial(r.exec, serial); err == nil && sameBlockDevice(found.DevicePath, entry.DevicePath) {
-			return found, true
-		}
-	}
-	r.Invalidate(volumeID)
-	return located{}, false
+	return entry.DevicePath, true
 }
 
 // deviceProof says how a device was proven to carry a requested serial.
 type deviceProof string
 
 const (
-	// proofKernel: an identity source (the kernel's sysfs serial, else udev or
-	// lsblk) reports exactly the requested serial for this device.
+	// proofKernel: the one whole disk whose kernel sysfs serial is exactly the
+	// requested serial.
 	proofKernel deviceProof = "kernel"
-	// proofByID: an exact /dev/disk/by-id name for the serial resolves to the
-	// device, and no identity source contradicts it.
+	// proofByID: no disk reports the serial in sysfs, an exact /dev/disk/by-id
+	// name for it resolves to the device, and no identity source contradicts it.
 	proofByID deviceProof = "by-id"
 )
 
 // located is a device found for a serial, with the proof that it is the one.
+// ByIDPath is set only for proofByID.
 type located struct {
 	DevicePath string
 	ByIDPath   string
@@ -246,65 +225,77 @@ func (l located) resolvedBy(suffix string) string {
 	return "by-id" + suffix
 }
 
-var errSerialNotFound = errors.New("serial not found")
+var (
+	// errSerialNotFound: nothing carries or names the serial yet. Retryable.
+	errSerialNotFound = errors.New("serial not found")
+	// errSerialNotYet: the one disk with the serial has no device node yet. Retryable.
+	errSerialNotYet = errors.New("serial device node not present yet")
+	// errSerialAmbiguous: more than one device carries the serial. Retryable;
+	// at the deadline it is a refusal (FailedPrecondition), never a pick.
+	errSerialAmbiguous = errors.New("serial ambiguous")
+	// errNoDeviceResolver: nothing can prove a serial without the resolver.
+	errNoDeviceResolver = errors.New("no device resolver")
+)
 
-func serialNotFoundError(serial string) error {
-	return fmt.Errorf("%w: no block device under %s carries serial %s, and no %s entry names it",
-		errSerialNotFound, filepath.Join(nodeSysfsRoot, "block"), serial, filepath.Join(defaultDiskPath, "disk", "by-id"))
+// locateError carries a readable message and a sentinel kind for errors.Is.
+type locateError struct {
+	kind error
+	msg  string
+}
+
+func (e *locateError) Error() string { return e.msg }
+func (e *locateError) Unwrap() error { return e.kind }
+
+func kindOf(err error) error {
+	for _, kind := range []error{errSerialAmbiguous, errSerialNotYet, errSerialNotFound} {
+		if errors.Is(err, kind) {
+			return kind
+		}
+	}
+	return err
+}
+
+func isRetryableLocateError(err error) bool {
+	return errors.Is(err, errSerialNotFound) || errors.Is(err, errSerialNotYet) || errors.Is(err, errSerialAmbiguous)
 }
 
 // locateBySerial is the only way a request with a serial finds its device.
-//  1. The kernel: the one whole disk under <sysfs>/block whose serial is exactly
-//     serial. It needs no udev, so it works before (or without) by-id links.
-//     More than one such disk is an error; it never picks one.
-//  2. Else an exact /dev/disk/by-id name, accepted only if no identity source
-//     contradicts it (covers disks with no readable serial).
+//  1. The kernel: scan <sysfs>/block for whole disks whose kernel serial is
+//     exactly serial. Exactly one → that disk, or a not-yet error while its
+//     device node is missing. More than one → ambiguous. It needs no udev.
+//  2. Only when NO disk reports the serial: an exact /dev/disk/by-id name,
+//     accepted only if no identity source contradicts it (covers disks with no
+//     readable serial).
 //
 // It never uses the volume's TARGET alias.
+// @gotcha: a kernel match never falls through to by-id: a stale by-id link would
+// then name another disk while the real one is still appearing.
 func locateBySerial(exec utilexec.Interface, serial string) (located, error) {
 	serial = strings.TrimSpace(serial)
 	if serial == "" {
 		return located{}, fmt.Errorf("serial is required")
 	}
-	byID := byIDEntriesForSerial(serial)
-	matches := []string{}
-	if entries, err := nodeReadDir(filepath.Join(nodeSysfsRoot, "block")); err == nil {
-		for _, entry := range entries {
-			name := entry.Name()
-			if !isCandidateWholeDisk(name) {
-				continue
-			}
-			if kernelSerial, _ := kernelBlockSerial(name); kernelSerial != "" && strings.EqualFold(kernelSerial, serial) {
-				matches = append(matches, name)
-			}
-		}
-	}
-	if len(matches) > 1 {
-		return located{}, fmt.Errorf("serial %s is ambiguous: block devices %s all carry it; refusing to choose", serial, strings.Join(matches, ", "))
-	}
-	if len(matches) == 1 {
+	matches := kernelSerialMatches(serial)
+	switch {
+	case len(matches) > 1:
+		return located{}, &locateError{kind: errSerialAmbiguous, msg: fmt.Sprintf("ambiguous: %s carry serial %s; refusing to choose", strings.Join(matches, ", "), serial)}
+	case len(matches) == 1:
 		devicePath := filepath.Join(defaultDiskPath, matches[0])
-		if _, err := nodeVolumePathStat(devicePath); err == nil {
-			found := located{DevicePath: devicePath, Proof: proofKernel}
-			for _, link := range byID {
-				if sameBlockDevice(link.resolved, devicePath) {
-					found.ByIDPath = link.path
-					break
-				}
-			}
-			return found, nil
+		if _, err := nodeVolumePathStat(devicePath); err != nil {
+			return located{}, &locateError{kind: errSerialNotYet, msg: fmt.Sprintf("block device %s carries serial %s but %s is not present yet: %v", matches[0], serial, devicePath, err)}
 		}
+		return located{DevicePath: devicePath, Proof: proofKernel}, nil
 	}
 
 	var found *located
-	for _, link := range byID {
+	for _, link := range byIDEntriesForSerial(serial) {
 		if identifyDevice(exec, link.resolved, serial) == serialMismatch {
 			klog.V(2).InfoS("Skipping by-id entry whose device reports another serial",
 				"byID", link.path, "device", link.resolved, "serial", serial)
 			continue
 		}
-		if found != nil && !sameBlockDevice(found.DevicePath, link.resolved) {
-			return located{}, fmt.Errorf("serial %s is ambiguous: by-id entries resolve to %s and %s; refusing to choose", serial, found.DevicePath, link.resolved)
+		if found != nil && found.DevicePath != link.resolved && !sameBlockDevice(found.DevicePath, link.resolved) {
+			return located{}, &locateError{kind: errSerialAmbiguous, msg: fmt.Sprintf("ambiguous: by-id entries for serial %s resolve to %s and %s; refusing to choose", serial, found.DevicePath, link.resolved)}
 		}
 		if found == nil {
 			found = &located{DevicePath: link.resolved, ByIDPath: link.path, Proof: proofByID}
@@ -313,7 +304,49 @@ func locateBySerial(exec utilexec.Interface, serial string) (located, error) {
 	if found != nil {
 		return *found, nil
 	}
-	return located{}, serialNotFoundError(serial)
+	return located{}, &locateError{kind: errSerialNotFound, msg: fmt.Sprintf("no block device under %s carries serial %s, and no %s entry names it",
+		filepath.Join(nodeSysfsRoot, "block"), serial, filepath.Join(defaultDiskPath, "disk", "by-id"))}
+}
+
+// kernelSerialMatches lists the whole disks under <sysfs>/block whose kernel
+// serial is exactly serial. Blank serials never match.
+func kernelSerialMatches(serial string) []string {
+	entries, err := nodeReadDir(filepath.Join(nodeSysfsRoot, "block"))
+	if err != nil {
+		return nil
+	}
+	matches := []string{}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !isCandidateWholeDisk(name) || !blockDeviceRunning(name) {
+			continue
+		}
+		if kernelSerial, _ := kernelBlockSerial(name); kernelSerial != "" && strings.EqualFold(kernelSerial, serial) {
+			matches = append(matches, name)
+		}
+	}
+	return matches
+}
+
+// blockDeviceRunning is false for a SCSI device whose device/state exists and
+// is not "running" (offline, deleted): a detached disk can linger there.
+func blockDeviceRunning(name string) bool {
+	raw, err := os.ReadFile(filepath.Join(nodeSysfsRoot, "block", name, "device", "state"))
+	if err != nil {
+		return true
+	}
+	return strings.TrimSpace(string(raw)) == "running"
+}
+
+// byIDPathFor returns a by-id entry naming serial that is the same block device
+// as devicePath, for display; "" when there is none.
+func byIDPathFor(devicePath, serial string) string {
+	for _, link := range byIDEntriesForSerial(serial) {
+		if link.resolved == devicePath || sameBlockDevice(link.resolved, devicePath) {
+			return link.path
+		}
+	}
+	return ""
 }
 
 type byIDEntry struct {
@@ -344,16 +377,14 @@ func byIDEntriesForSerial(serial string) []byIDEntry {
 	return out
 }
 
-// isCandidateWholeDisk filters <sysfs>/block names: no loop, ram/zram, optical
-// or device-mapper devices, and no partitions.
+// isCandidateWholeDisk skips loop, ram/zram, optical and device-mapper devices.
+// Partitions need no check: /sys/block lists whole disks only (a partition is a
+// subdirectory of its disk there).
 func isCandidateWholeDisk(name string) bool {
 	for _, prefix := range []string{"loop", "ram", "zram", "sr", "dm-"} {
 		if strings.HasPrefix(name, prefix) {
 			return false
 		}
-	}
-	if _, err := os.Stat(filepath.Join(nodeSysfsRoot, "block", name, "partition")); err == nil {
-		return false
 	}
 	return true
 }
@@ -378,17 +409,19 @@ func blockDeviceNumber(path string) (uint64, bool) {
 	return uint64(st.Rdev), true //nolint:unconvert // Rdev is uint32 on some platforms
 }
 
-// byIDNameHasSerial reports whether a /dev/disk/by-id entry name names the
-// serial as a whole trailing token: the name equals the serial or ends with
-// "_"+serial or "-"+serial (case-insensitive).
-// @gotcha: never a substring match - onecsi-43 is a substring of onecsi-439.
+// byIDNameHasSerial reports whether a /dev/disk/by-id entry name is exactly a
+// name udev gives the disk with this serial: the serial itself,
+// "<bus/model>_"+serial (scsi-0QEMU_QEMU_HARDDISK_<serial>, nvme-..._<serial>),
+// or "virtio-"+serial (virtio-blk). Case-insensitive.
+// @gotcha: never a substring match (onecsi-43 is in onecsi-439), and never a bare
+// "-"+serial suffix: serials contain '-', so "x-onecsi-43" would match.
 func byIDNameHasSerial(base, serial string) bool {
 	base = strings.ToLower(strings.TrimSpace(base))
 	serial = strings.ToLower(strings.TrimSpace(serial))
 	if serial == "" || base == "" {
 		return false
 	}
-	return base == serial || strings.HasSuffix(base, "_"+serial) || strings.HasSuffix(base, "-"+serial)
+	return base == serial || base == "virtio-"+serial || strings.HasSuffix(base, "_"+serial)
 }
 
 func (r *NodeDeviceResolver) resolveAlias(volumeName string, started time.Time) (string, deviceResolutionResult, error) {
@@ -464,17 +497,15 @@ func (r *NodeDeviceResolver) markUdevadmMissingLogged() bool {
 	return true
 }
 
-func (r *NodeDeviceResolver) remember(volumeID, imageID, serial string, found located) {
-	if r == nil || !r.cacheEnabled || strings.TrimSpace(volumeID) == "" || strings.TrimSpace(found.DevicePath) == "" {
+func (r *NodeDeviceResolver) remember(volumeID, imageID, devicePath string) {
+	if r == nil || !r.cacheEnabled || strings.TrimSpace(volumeID) == "" || strings.TrimSpace(devicePath) == "" {
 		return
 	}
 	r.mu.Lock()
 	r.cache[volumeID] = nodeDeviceCacheEntry{
 		VolumeID:        volumeID,
 		ImageID:         imageID,
-		Serial:          serial,
-		DevicePath:      found.DevicePath,
-		ByIDPath:        found.ByIDPath,
+		DevicePath:      devicePath,
 		LastConfirmedAt: deviceResolverNow().UTC(),
 	}
 	r.mu.Unlock()

@@ -96,11 +96,10 @@ func sidLabWorker(t *testing.T, root, diskPath string) {
 	}
 	// Skip probes: these carry the target serial, so counting any of them
 	// would make the lookup ambiguous. The real devices carry no such serial.
+	// (Partitions are not top-level entries in /sys/block, so none is laid out.)
 	for _, name := range []string{"loop0", "loop7", "zram0", "sr0", "dm-0", "ram0"} {
 		disk(name, vpdPage80("onecsi-40"))
 	}
-	disk("sdb1", vpdPage80("onecsi-40"))
-	require.NoError(t, os.WriteFile(filepath.Join(root, "block", "sdb1", "partition"), []byte("1\n"), 0o444))
 }
 
 func TestResolveFindsDiskBySysfsAmongSidLabDevices(t *testing.T) {
@@ -142,7 +141,8 @@ func TestResolveRefusesAmbiguousKernelSerial(t *testing.T) {
 	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec(), nil)
 	_, _, err := r.Resolve(context.Background(), "vol-1", "sdc", map[string]string{publishContextDeviceSerial: "onecsi-11"}, 0)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "ambiguous")
+	assert.Contains(t, err.Error(), "ambiguous: sdb, sdc carry serial onecsi-11")
+	assert.Equal(t, codes.FailedPrecondition, deviceResolutionFailureCode(err))
 }
 
 func TestResolveSerialTimeoutNamesWhatWasSearched(t *testing.T) {
@@ -157,6 +157,8 @@ func TestResolveSerialTimeoutNamesWhatWasSearched(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "carries serial onecsi-11, and no")
 	assert.NotContains(t, err.Error(), filepath.Join(diskPath, "sdc"), "alias candidates must not be listed")
+	assert.Contains(t, err.Error(), "TARGET sdc is not used for serial requests")
+	assert.Equal(t, codes.DeadlineExceeded, deviceResolutionFailureCode(err))
 }
 
 func TestKernelDeviceSerialNVMe(t *testing.T) {
@@ -310,9 +312,10 @@ func TestReportAgreesWithResolverOnStaleByIDLink(t *testing.T) {
 
 	path, _, err := r.Resolve(context.Background(), "", "sdc", map[string]string{publishContextDeviceSerial: "onecsi-11"}, 0)
 	require.NoError(t, err)
-	_, reported := resolveByIDForReport("onecsi-11", "fallback")
-	assert.Equal(t, path, reported)
-	assert.Equal(t, filepath.Join(diskPath, "sdc"), reported)
+	reported, err := resolveByIDForReport(newRecordingExec(), "onecsi-11")
+	require.NoError(t, err)
+	assert.Equal(t, path, reported.DevicePath)
+	assert.Equal(t, filepath.Join(diskPath, "sdc"), reported.DevicePath)
 }
 
 // The SCSI rescan writes under nodeSysfsRoot, never the real /sys in tests.
@@ -330,4 +333,146 @@ func TestRecoverySequenceRescansUnderSysfsRoot(t *testing.T) {
 	got, err := os.ReadFile(scan)
 	require.NoError(t, err)
 	assert.Equal(t, "- - -", string(got))
+}
+
+// Safety: when the kernel names exactly one disk for the serial, that disk is
+// the answer or the lookup waits. A stale by-id link to another disk is never
+// used, even while the real disk's device node is missing.
+func TestLocateKernelMatchNeverFallsBackToByID(t *testing.T) {
+	root := withTestSysfs(t)
+	diskPath := withTestDiskPath(t)
+	steppingResolverClock(t)
+	writeSysfsVPD80(t, root, "sdb", vpdPage80("onecsi-11")) // no /dev/sdb yet
+	writeDisk(t, diskPath, "sdc")
+	require.NoError(t, os.MkdirAll(filepath.Join(root, "block", "sdc"), 0o755)) // serial unknown
+	linkByID(t, diskPath, "scsi-0QEMU_QEMU_HARDDISK_onecsi-11", "sdc")
+
+	_, err := locateBySerial(newRecordingExec(), "onecsi-11")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errSerialNotYet)
+
+	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec(), nil)
+	path, _, err := r.Resolve(context.Background(), "vol-1", "sdc", map[string]string{publishContextDeviceSerial: "onecsi-11"}, 3*time.Second)
+	require.Error(t, err, "resolved %s", path)
+	assert.Empty(t, path)
+	assert.Equal(t, codes.DeadlineExceeded, deviceResolutionFailureCode(err))
+}
+
+func TestByIDNameHasSerialExactTokens(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{"onecsi-43", true},
+		{"virtio-onecsi-43", true},
+		{"VIRTIO-ONECSI-43", true},
+		{"scsi-0QEMU_QEMU_HARDDISK_onecsi-43", true},
+		{"nvme-QEMU_NVMe_Ctrl_onecsi-43", true},
+		{"x-onecsi-43", false},
+		{"scsi-0QEMU_QEMU_HARDDISK_onecsi-439", false},
+		{"onecsi-439", false},
+		{"scsi-0QEMU_QEMU_HARDDISK_onecsi-43-part1", false},
+		{"virtio-onecsi-43-part1", false},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.want, byIDNameHasSerial(c.name, "onecsi-43"), c.name)
+	}
+	assert.False(t, byIDNameHasSerial("onecsi-43", ""))
+}
+
+func TestLocateSkipsOfflineSCSIDevices(t *testing.T) {
+	root := withTestSysfs(t)
+	diskPath := withTestDiskPath(t)
+	writeDisk(t, diskPath, "sdb")
+	want := writeDisk(t, diskPath, "sdc")
+	writeSysfsVPD80(t, root, "sdb", vpdPage80("onecsi-11"))
+	writeSysfsVPD80(t, root, "sdc", vpdPage80("onecsi-11"))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "block", "sdb", "device", "state"), []byte("offline\n"), 0o444))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "block", "sdc", "device", "state"), []byte("running\n"), 0o444))
+
+	found, err := locateBySerial(newRecordingExec(), "onecsi-11")
+	require.NoError(t, err)
+	assert.Equal(t, want, found.DevicePath)
+}
+
+// Ambiguity is retried: the stale twin disappears and the lookup succeeds.
+func TestResolveRetriesAmbiguityUntilStaleTwinDisappears(t *testing.T) {
+	root := withTestSysfs(t)
+	diskPath := withTestDiskPath(t)
+	steppingResolverClock(t)
+	writeDisk(t, diskPath, "sdb")
+	want := writeDisk(t, diskPath, "sdd")
+	writeSysfsVPD80(t, root, "sdb", vpdPage80("onecsi-11"))
+	writeSysfsVPD80(t, root, "sdd", vpdPage80("onecsi-11"))
+	originalSleep := nodeDeviceSleep
+	nodeDeviceSleep = func(time.Duration) { _ = os.RemoveAll(filepath.Join(root, "block", "sdb")) }
+	t.Cleanup(func() { nodeDeviceSleep = originalSleep })
+	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec(), nil)
+
+	path, resolution, err := r.Resolve(context.Background(), "vol-1", "sdc", map[string]string{publishContextDeviceSerial: "onecsi-11"}, 10*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, want, path)
+	assert.Equal(t, "kernel-serial-recovery", resolution.ResolvedBy)
+}
+
+// Ambiguity that persists to the deadline is a refusal, reported by name.
+func TestStageVolumeAmbiguousSerialIsFailedPrecondition(t *testing.T) {
+	root := withTestSysfs(t)
+	diskPath := withTestDiskPath(t)
+	steppingResolverClock(t)
+	for _, name := range []string{"sdb", "sdd"} {
+		writeDisk(t, diskPath, name)
+		writeSysfsVPD80(t, root, name, vpdPage80("onecsi-11"))
+	}
+	ns, fm, rec, staging := localDiskNode(t, diskPath, "")
+
+	_, err := ns.NodeStageVolume(context.Background(), stageRequest(staging, "sdc"))
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "ambiguous: sdb, sdd carry serial onecsi-11")
+	assert.Empty(t, fm.GetLog())
+	assert.Empty(t, rec.formatOrMountCommands())
+}
+
+// A kernel match never needs the by-id scan.
+func TestLocateKernelMatchSkipsByIDScan(t *testing.T) {
+	root := withTestSysfs(t)
+	diskPath := withTestDiskPath(t)
+	writeDisk(t, diskPath, "sdb")
+	writeSysfsVPD80(t, root, "sdb", vpdPage80("onecsi-11"))
+	original := nodeByIDGlob
+	calls := 0
+	nodeByIDGlob = func(pattern string) ([]string, error) { calls++; return original(pattern) }
+	t.Cleanup(func() { nodeByIDGlob = original })
+
+	found, err := locateBySerial(newRecordingExec(), "onecsi-11")
+	require.NoError(t, err)
+	assert.Equal(t, proofKernel, found.Proof)
+	assert.Zero(t, calls)
+}
+
+func TestClassifyDeviceSerialMovedUsesBlockDeviceEquality(t *testing.T) {
+	withTestSysfs(t)
+	diskPath := withTestDiskPath(t)
+	fakeBlockDeviceNumbers(t)
+	sdb := writeDisk(t, diskPath, "sdb")
+	sdc := writeDisk(t, diskPath, "sdc")
+	base := VolumeHealthReport{ExpectedSerial: "onecsi-11", MountPath: "/stage", MountSource: sdb}
+
+	moved := base
+	moved.ResolvedDevicePath = sdc
+	status, reason, _ := classifyVolumeHealthReport(moved)
+	assert.Equal(t, "stale", status)
+	assert.Equal(t, "DeviceSerialMoved", reason)
+
+	same := base
+	same.ResolvedDevicePath = sdb
+	status, reason, _ = classifyVolumeHealthReport(same)
+	assert.Equal(t, "healthy", status, reason)
+
+	unresolved := base
+	unresolved.ResolutionError = "ambiguous: sdb, sdd carry serial onecsi-11"
+	status, reason, _ = classifyVolumeHealthReport(unresolved)
+	assert.Equal(t, "attention", status)
+	assert.Equal(t, "DeviceSerialUnresolved", reason)
 }
