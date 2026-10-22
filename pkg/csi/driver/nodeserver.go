@@ -18,6 +18,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -150,14 +151,12 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Error(codes.InvalidArgument, "[volumeName] entry is required in volume context")
 	}
 	deviceTimeout := ns.deviceDiscoveryTimeout(volumeContext)
-	devicePath, resolution, err := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout)
+	devicePath, resolution, err := ns.resolveDevicePathWithContext(ctx, volumeID, volName, volumeContext, deviceTimeout)
 	if err != nil {
-		ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "timeout", time.Since(started))
-		ns.recordLocalDeviceMissing(ctx, volumeID, volName, stagingTargetPath, volumeContext, err)
-		ns.recordPVCWarningFromPublishContext(ctx, volumeContext, eventReasonDeviceDiscoveryTimeout, err.Error())
+		code := ns.recordDeviceResolutionFailure(ctx, volumeID, volName, stagingTargetPath, volumeContext, time.Since(started), err)
 		klog.V(0).ErrorS(err, "Failed to resolve device path",
 			"method", "NodeStageVolume", "volumeID", volumeID, "volumeName", volName, "deviceDiscoveryTimeout", deviceTimeout)
-		return nil, status.Error(codes.DeadlineExceeded, err.Error())
+		return nil, status.Error(code, err.Error())
 	}
 	ns.recordDeviceResolutionFromPublishContext(ctx, volumeContext, resolution)
 	ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "success", resolution.Latency)
@@ -398,14 +397,12 @@ func (ns *NodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	switch accessType.(type) {
 	case *csi.VolumeCapability_Block:
 		deviceTimeout := ns.deviceDiscoveryTimeout(volumeContext)
-		devicePath, resolution, resolveErr := ns.resolveDevicePathWithContext(volumeID, volName, volumeContext, deviceTimeout)
+		devicePath, resolution, resolveErr := ns.resolveDevicePathWithContext(ctx, volumeID, volName, volumeContext, deviceTimeout)
 		if resolveErr != nil {
-			ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "timeout", deviceTimeout)
-			ns.recordLocalDeviceMissing(ctx, volumeID, volName, stagingTargetPath, volumeContext, resolveErr)
-			ns.recordPVCWarningFromPublishContext(ctx, volumeContext, eventReasonDeviceDiscoveryTimeout, resolveErr.Error())
+			code := ns.recordDeviceResolutionFailure(ctx, volumeID, volName, stagingTargetPath, volumeContext, deviceTimeout, resolveErr)
 			klog.V(0).ErrorS(resolveErr, "Failed to resolve device path for block volume publish",
 				"method", "NodePublishVolume", "volumeID", volumeID, "volumeName", volName, "deviceDiscoveryTimeout", deviceTimeout)
-			return nil, status.Error(codes.DeadlineExceeded, resolveErr.Error())
+			return nil, status.Error(code, resolveErr.Error())
 		}
 		ns.clearLocalDeviceMissing(ctx, volumeID)
 		ns.recordDeviceResolutionFromPublishContext(ctx, volumeContext, resolution)
@@ -1013,16 +1010,41 @@ func requireSerialProof(publishContext map[string]string, devicePath string, res
 }
 
 func (ns *NodeServer) resolveDevicePath(volumeName string, timeout time.Duration) (string, deviceResolutionResult, error) {
-	return ns.resolveDevicePathWithContext("", volumeName, nil, timeout)
+	return ns.resolveDevicePathWithContext(context.Background(), "", volumeName, nil, timeout)
 }
 
-func (ns *NodeServer) resolveDevicePathWithContext(volumeID, volumeName string, publishContext map[string]string, timeout time.Duration) (string, deviceResolutionResult, error) {
+// deviceResolutionFailureCode: a refusal (ambiguous serial, no resolver) is
+// FailedPrecondition; only a genuine not-found timeout is DeadlineExceeded.
+func deviceResolutionFailureCode(err error) codes.Code {
+	if errors.Is(err, errSerialAmbiguous) || errors.Is(err, errNoDeviceResolver) {
+		return codes.FailedPrecondition
+	}
+	return codes.DeadlineExceeded
+}
+
+// recordDeviceResolutionFailure records metrics and events for a failed
+// resolution and returns the gRPC code to answer with. Only a timeout is
+// recorded as a missing device.
+func (ns *NodeServer) recordDeviceResolutionFailure(ctx context.Context, volumeID, volName, stagingTargetPath string, volumeContext map[string]string, duration time.Duration, err error) codes.Code {
+	code := deviceResolutionFailureCode(err)
+	if code != codes.DeadlineExceeded {
+		ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "refused", duration)
+		ns.recordPVCWarningFromPublishContext(ctx, volumeContext, eventReasonDeviceIdentityRefused, err.Error())
+		return code
+	}
+	ns.Driver.metrics.RecordNodeDeviceResolutionDuration("disk", "timeout", duration)
+	ns.recordLocalDeviceMissing(ctx, volumeID, volName, stagingTargetPath, volumeContext, err)
+	ns.recordPVCWarningFromPublishContext(ctx, volumeContext, eventReasonDeviceDiscoveryTimeout, err.Error())
+	return code
+}
+
+func (ns *NodeServer) resolveDevicePathWithContext(ctx context.Context, volumeID, volumeName string, publishContext map[string]string, timeout time.Duration) (string, deviceResolutionResult, error) {
 	if ns.deviceResolver != nil {
-		return ns.deviceResolver.Resolve(context.Background(), volumeID, volumeName, publishContext, timeout)
+		return ns.deviceResolver.Resolve(ctx, volumeID, volumeName, publishContext, timeout)
 	}
 	if serial := strings.TrimSpace(publishContext[publishContextDeviceSerial]); serial != "" {
 		// Only the resolver can prove a serial; the alias below would guess.
-		return "", deviceResolutionResult{}, fmt.Errorf("no device resolver to locate serial %s for volume %q", serial, volumeName)
+		return "", deviceResolutionResult{}, fmt.Errorf("%w to locate serial %s for volume %q", errNoDeviceResolver, serial, volumeName)
 	}
 
 	started := time.Now()

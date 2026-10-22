@@ -298,6 +298,7 @@ func TestStageVolumeRefusesSerialRequestWithoutResolver(t *testing.T) {
 
 	_, err := ns.NodeStageVolume(context.Background(), stageRequest(staging, "sdc"))
 	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	assert.Contains(t, err.Error(), "no device resolver to locate serial onecsi-11")
 	assert.Empty(t, fm.GetLog(), "FormatAndMount must not have been called")
 	assert.Empty(t, rec.formatOrMountCommands(), "FormatAndMount must not have been called")
@@ -347,9 +348,9 @@ func TestResolveByIDPrefixCollision(t *testing.T) {
 	}
 }
 
-// A cached device that now carries another volume's serial is dropped and
-// the volume is resolved again.
-func TestResolveDropsCacheEntryWithOtherKernelSerial(t *testing.T) {
+// A serial request never uses the cache: a cached device that now carries
+// another volume's serial is not returned.
+func TestResolveSerialIgnoresCache(t *testing.T) {
 	root := withTestSysfs(t)
 	diskPath := withTestDiskPath(t)
 	steppingResolverClock(t)
@@ -357,9 +358,8 @@ func TestResolveDropsCacheEntryWithOtherKernelSerial(t *testing.T) {
 	want := writeDisk(t, diskPath, "sdc")
 	writeSysfsVPD80(t, root, "sdb", vpdPage80("onecsi-77"))
 	writeSysfsVPD80(t, root, "sdc", vpdPage80("onecsi-42"))
-	linkByID(t, diskPath, "scsi-0QEMU_QEMU_HARDDISK_onecsi-42", "sdc")
 	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec(), nil)
-	r.remember("vol-1", "42", "onecsi-42", located{DevicePath: stale, ByIDPath: filepath.Join(diskPath, "disk", "by-id", "virtio-onecsi-42")})
+	r.remember("vol-1", "42", stale)
 
 	path, resolution, err := r.Resolve(context.Background(), "vol-1", "sdc", map[string]string{publishContextDeviceSerial: "onecsi-42"}, time.Second)
 	require.NoError(t, err)

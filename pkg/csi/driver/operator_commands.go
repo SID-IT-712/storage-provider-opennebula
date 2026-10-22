@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	utilexec "k8s.io/utils/exec"
 	"math"
 	"os"
 	"path/filepath"
@@ -70,6 +71,7 @@ type VolumeHealthReport struct {
 	ExpectedSerial       string                               `json:"expectedSerial,omitempty"`
 	ByIDPath             string                               `json:"byIDPath,omitempty"`
 	ResolvedDevicePath   string                               `json:"resolvedDevicePath,omitempty"`
+	ResolutionError      string                               `json:"resolutionError,omitempty"`
 	StagePath            string                               `json:"stagePath,omitempty"`
 	MountPath            string                               `json:"mountPath,omitempty"`
 	MountSource          string                               `json:"mountSource,omitempty"`
@@ -443,8 +445,16 @@ func collectVolumeHealthReports(ctx context.Context, kubeClient kubernetes.Inter
 			report.StagePath = session.StagingTargetPath
 			report.ExpectedSerial = session.DeviceSerial
 			report.OpenNebulaImageID = firstNonEmpty(session.OpenNebulaImageID, report.OpenNebulaImageID)
-			report.ResolvedDevicePath = session.DevicePath
-			report.ByIDPath, report.ResolvedDevicePath = resolveByIDForReport(session.DeviceSerial, report.ResolvedDevicePath)
+			if session.DeviceSerial != "" {
+				found, locateErr := resolveByIDForReport(utilexec.New(), session.DeviceSerial)
+				if locateErr != nil {
+					report.ResolutionError = locateErr.Error()
+				} else {
+					report.ByIDPath, report.ResolvedDevicePath = found.ByIDPath, found.DevicePath
+				}
+			} else {
+				report.ResolvedDevicePath = session.DevicePath
+			}
 			report.MountSource = mountSources[session.StagingTargetPath]
 			report.MountPath = session.StagingTargetPath
 			report.Status, report.Reason, report.Message = classifyVolumeHealthReport(report)
@@ -530,17 +540,18 @@ func sharedSessionForVolume(sessions []sharedFilesystemSession, volumeID string)
 	return sharedFilesystemSession{}, false
 }
 
-// resolveByIDForReport reports where the resolver would find serial, through
-// the same locateBySerial the resolver uses.
-func resolveByIDForReport(serial, fallback string) (string, string) {
-	if strings.TrimSpace(serial) == "" {
-		return "", fallback
-	}
-	found, err := locateBySerial(nil, serial)
+// resolveByIDForReport locates serial exactly as the resolver does
+// (locateBySerial, real exec). ByIDPath is filled for display even when the
+// proof is the kernel serial.
+func resolveByIDForReport(exec utilexec.Interface, serial string) (located, error) {
+	found, err := locateBySerial(exec, serial)
 	if err != nil {
-		return "", fallback
+		return located{}, err
 	}
-	return found.ByIDPath, found.DevicePath
+	if found.ByIDPath == "" {
+		found.ByIDPath = byIDPathFor(found.DevicePath, serial)
+	}
+	return found, nil
 }
 
 func classifyVolumeHealthReport(report VolumeHealthReport) (string, string, string) {
@@ -553,11 +564,15 @@ func classifyVolumeHealthReport(report VolumeHealthReport) (string, string, stri
 	if strings.TrimSpace(report.MountSource) == "" {
 		return "stale", "MountSourceMissing", "Mount path is not present in the current mount table"
 	}
-	if strings.HasPrefix(report.MountSource, "/dev/") {
+	if strings.HasPrefix(report.MountSource, filepath.Clean(defaultDiskPath)+"/") {
 		if _, err := os.Stat(report.MountSource); err != nil {
 			return "stale", "MountSourceDeviceMissing", err.Error()
 		}
-		if report.ExpectedSerial != "" && !strings.Contains(strings.ToLower(report.MountSource), strings.ToLower(report.ExpectedSerial)) && report.ByIDPath != "" && report.ResolvedDevicePath != report.MountSource {
+		if report.ExpectedSerial != "" && report.ResolutionError != "" {
+			return "attention", "DeviceSerialUnresolved", report.ResolutionError
+		}
+		// ResolvedDevicePath is the device locateBySerial proved for the serial.
+		if report.ExpectedSerial != "" && report.ResolvedDevicePath != "" && report.ResolvedDevicePath != report.MountSource && !sameBlockDevice(report.ResolvedDevicePath, report.MountSource) {
 			return "stale", "DeviceSerialMoved", fmt.Sprintf("expected serial %s resolves to %s but mount source is %s", report.ExpectedSerial, report.ResolvedDevicePath, report.MountSource)
 		}
 	}
