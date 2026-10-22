@@ -47,21 +47,33 @@ located only by proof:
   A blank serial (Longhorn iSCSI disks report 36 spaces) is unknown. Unknown is
   never a match.
 - `locateBySerial(serial)` is the only way a serial request finds its disk:
-  1. The one whole disk under `/sys/block` whose kernel serial is exactly the
-     serial. loop, ram, zram, sr, dm- devices and partitions are skipped. Two such
-     disks are an error, never a choice. This works without by-id links.
-  2. Otherwise an exact `/dev/disk/by-id` name (a whole trailing token, never a
-     substring), accepted unless an identity source contradicts it. This covers
-     disks with no readable serial.
+  1. The kernel: the whole disks under `/sys/block` whose kernel serial is
+     exactly the serial. loop, ram, zram, sr and dm- devices are skipped, and so
+     is a SCSI device whose `device/state` is not `running`. Partitions are not
+     top-level in `/sys/block`. Exactly one match is the answer. If its `/dev`
+     node is not there yet, the lookup waits; it **never** falls through to by-id.
+     Two matches are ambiguous: the lookup retries until the timeout, then refuses
+     (`ambiguous: sdb, sdd carry serial X`). It never picks one.
+  2. Only when no disk reports the serial, an exact `/dev/disk/by-id` name:
+     the serial itself, `<bus/model>_<serial>`, or `virtio-<serial>`. A bare
+     `-<serial>` suffix is not accepted, because serials contain `-`. The name is
+     accepted unless an identity source contradicts it. This covers disks with
+     no readable serial.
   3. Never the TARGET alias.
-- `Resolve` returns the proof with the device. The cache re-proves every hit.
-  NodeStage, block publish and recovery all refuse a serial request's device that
-  has no proof. A serial request with no resolver fails instead of using the alias.
+- `Resolve` returns the proof with the device. Serial requests never use the
+  cache, because a sysfs read is cheap and is the proof itself. NodeStage, block
+  publish and recovery all refuse a serial request's device that has no proof.
+  A serial request with no resolver fails instead of using the alias.
+- Error codes: ambiguity, a missing resolver and a missing proof are
+  `FailedPrecondition`. Only a genuine not-found is `DeadlineExceeded`, and its
+  message names the TARGET it did not use.
 - The re-stage check runs `identifyDevice` on the mount source. A mismatch makes
   it stale. A match makes it healthy. Unknown counts as healthy only if the mount
   source is the same block device that `locateBySerial` proves.
-- The operator report locates through the same `locateBySerial`. The SCSI rescan
-  writes under the same sysfs root.
+- The operator report locates through the same `locateBySerial`, with the real
+  exec. It shows a locate error instead of a stale device path. `DeviceSerialMoved`
+  compares the proven device with the mount source as block devices. The SCSI
+  rescan writes under the same sysfs root.
 
 **Files:** `pkg/csi/driver/node_device_resolver.go`, `nodeserver.go`,
 `nodeserver_localdisk_recovery.go`, `operator_commands.go`. Tests are in
@@ -79,7 +91,7 @@ reach the serial check.
 |---|---|---|
 | `master` | upstream, untouched | Never commit here. Sync from `upstream/master`. |
 | `fix/reconciler-driver-filter` | **only** fix 1, one commit on upstream | Upstream-clean: no fork plumbing, no private references. This is what an upstream PR would come from. |
-| `fix/restage-serial-check` | fix 2's PR branch (PR #1, base `sid/release`) | Fix 2 is two code-only `fix(node):` commits (code and tests, no fork files), so they can be cherry-picked onto fix 1 for an upstream PR. Merge PR #1 with a rebase or a merge commit, never a squash, so those commits stay separate from the `docs(sid):` commits on `sid/release`. |
+| `fix/restage-serial-check` | fix 2's PR branch (PR #1, base `sid/release`) | Fix 2 is three code-only `fix(node):` commits (code and tests, no fork files), so they can be cherry-picked onto fix 1 for an upstream PR. Merge PR #1 with a rebase or a merge commit, never a squash, so those commits stay separate from the `docs(sid):` commits on `sid/release`. |
 | `sid/release` | both fixes **plus** this file and our workflows | Our deploy line. Images are built from here. Never merge it into a fix branch. |
 
 ## Images
@@ -99,15 +111,16 @@ reach the serial check.
 
 1. `git fetch upstream --tags`, then rebase `fix/reconciler-driver-filter` onto the new tag.
 2. Rebase `sid/release` onto the rebased fix-1 branch, keeping **every** commit:
-   fix 2's two code commits (`fix(node): prove disk identity by kernel serial ...`
-   and `fix(node): decide disk identity in one place ...`), and the fork-only
+   fix 2's three code commits (`fix(node): prove disk identity by kernel serial ...`,
+   `fix(node): decide disk identity in one place ...` and
+   `fix(node): never fall back from a kernel serial match ...`), and the fork-only
    commits (this file, the workflows). Before tagging, check that
-   `git log --oneline <new-tag>..sid/release` still lists both fix-2 commits. If one
+   `git log --oneline <new-tag>..sid/release` still lists all three fix-2 commits. If one
    is dropped, the re-stage failure and the alias path come back silently.
-3. For an upstream PR of fix 2, cherry-pick both commits, in order, onto the
+3. For an upstream PR of fix 2, cherry-pick all three commits, in order, onto the
    rebased fix-1 branch. They carry no fork files.
 4. Run both regression suites, the reconciler filter and every fix-2 test:
-   `go test ./pkg/csi/driver/ -count=1 -run '^(TestKernelDeviceSerial|TestSidLab|TestIdentifyDevice|TestResolve|TestNodeDeviceResolver|TestRequireSerialProof|TestStageVolumeRestage|TestStageVolumeNeverUsesAlias|TestStageVolumeRefusesSerialRequestWithoutResolver|TestStageVolumeByIDProof|TestStageVolumeKeepsLocalDeviceReport|TestBlockPublishRefuses|TestReportAgrees|TestRecoverySequence)'`.
+   `go test ./pkg/csi/driver/ -count=1 -run '^(TestKernelDeviceSerial|TestSidLab|TestIdentifyDevice|TestResolve|TestLocate|TestByIDNameHasSerial|TestNodeDeviceResolver|TestRequireSerialProof|TestStageVolumeRestage|TestStageVolumeNeverUsesAlias|TestStageVolumeRefusesSerialRequestWithoutResolver|TestStageVolumeByIDProof|TestStageVolumeAmbiguous|TestStageVolumeKeepsLocalDeviceReport|TestBlockPublishRefuses|TestReportAgrees|TestClassifyDeviceSerialMoved|TestRecoverySequence)'`.
    Then tag `sid-v<new-upstream>-1`.
 5. If upstream has merged an equivalent fix, retire this fork: pin upstream's image
    in our deployment tooling, and trust its repository to run the reconciler only
