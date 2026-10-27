@@ -416,11 +416,27 @@ func (p *PersistentDiskVolumeProvider) ExpandVolume(ctx context.Context, volume 
 			return 0, fmt.Errorf("failed to expand volume %s on vm %d disk %d: %w", volume, vmID, diskID, err)
 		}
 	} else {
-		message := "expanding detached OpenNebula persistent disks is not supported because one.image.update does not change canonical image size; attach the volume and retry expansion"
 		if !allowDetached {
-			message = "expanding detached OpenNebula persistent disks is disabled; attach the volume or enable the detachedDiskExpansion feature gate and retry expansion"
+			return 0, &datastoreConfigError{
+				message: "expanding detached OpenNebula persistent disks is disabled; attach the volume or enable the detachedDiskExpansion feature gate and retry expansion",
+			}
 		}
-		return 0, &datastoreConfigError{message: message}
+		// A detached disk cannot be resized in place: one.image.update does not
+		// change OpenNebula's canonical image size, and one.vm.diskresize needs a
+		// VM. Record the requested size on the image instead. AttachVolume's
+		// restoreAttachedVolumeRequestedSize grows the disk to it before
+		// ControllerPublish returns, so the node never sees the smaller disk, and
+		// VolumeExists reports it from now on, which keeps a repeated expand
+		// idempotent.
+		if err := p.persistCSIRequestedSize(ctx, volumeID, volume, size, sizeMB); err != nil {
+			return 0, err
+		}
+		klog.V(1).InfoS("Deferred detached volume expansion to the next attach",
+			"volume", volume,
+			"imageID", volumeID,
+			"requestedSizeBytes", size,
+			"requestedSizeMB", sizeMB)
+		return size, nil
 	}
 
 	var completedSizeBytes int64

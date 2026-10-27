@@ -119,7 +119,7 @@ func TestPersistentDiskLifecycle(t *testing.T) {
 	t.Logf("volume %s deleted successfully", volumeTestName)
 }
 
-func TestPersistentDiskDetachedExpansionUnsupported(t *testing.T) {
+func TestPersistentDiskDetachedExpansionDeferred(t *testing.T) {
 	if os.Getenv("RUN_OPENNEBULA_INTEGRATION_TESTS") != "1" {
 		t.Skip("set RUN_OPENNEBULA_INTEGRATION_TESTS=1 to run OpenNebula integration tests")
 	}
@@ -165,10 +165,18 @@ func TestPersistentDiskDetachedExpansionUnsupported(t *testing.T) {
 	})
 
 	newSize, err := volumeProvider.ExpandVolume(ctx, volumeTestName, expandedSize, true)
+	require.NoError(t, err)
+	assert.Equal(t, expandedSize, newSize)
+
+	_, reported, err := volumeProvider.VolumeExists(ctx, volumeTestName)
+	require.NoError(t, err)
+	assert.Equal(t, expandedSize, int64(reported))
+
+	newSize, err = volumeProvider.ExpandVolume(ctx, volumeTestName, expandedSize*2, false)
 	require.Error(t, err)
 	assert.Zero(t, newSize)
 	assert.True(t, IsDatastoreConfigError(err))
-	assert.Contains(t, err.Error(), "expanding detached OpenNebula persistent disks is not supported")
+	assert.Contains(t, err.Error(), "expanding detached OpenNebula persistent disks is disabled")
 }
 
 func getIntegrationTestDatastores() []string {
