@@ -324,7 +324,7 @@ func (s *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolu
 	if contentSource != nil {
 		switch source := contentSource.Type.(type) {
 		case *csi.VolumeContentSource_Volume:
-			result, err := s.volumeProvider.CloneVolume(ctx, name, source.Volume.GetVolumeId(), selection)
+			result, err := s.volumeProvider.CloneVolume(ctx, name, source.Volume.GetVolumeId(), requiredBytes, selection)
 			if err != nil {
 				switch {
 				case opennebula.IsDatastoreConfigError(err):

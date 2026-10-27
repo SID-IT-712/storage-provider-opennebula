@@ -127,13 +127,19 @@ func (f *fakeOneRPC) handle(call xmlRPCCall) (bool, string) {
 }
 
 func (f *fakeOneRPC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	serveFakeXMLRPC(w, r, f.handle)
+}
+
+// serveFakeXMLRPC decodes one XML-RPC call, hands it to handle and writes
+// OpenNebula's [ok, body, error code] response.
+func serveFakeXMLRPC(w http.ResponseWriter, r *http.Request, handle func(xmlRPCCall) (bool, string)) {
 	body, _ := io.ReadAll(r.Body)
 	var call xmlRPCCall
 	if err := xml.Unmarshal(body, &call); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	ok, payload := f.handle(call)
+	ok, payload := handle(call)
 	okValue := 0
 	if ok {
 		okValue = 1
@@ -142,9 +148,14 @@ func (f *fakeOneRPC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		errCode = 4096
 	}
+	// OpenNebula returns an ID (clone, allocate) as an int, everything else as a string.
+	value := "<string>" + html.EscapeString(payload) + "</string>"
+	if _, err := strconv.Atoi(payload); ok && err == nil {
+		value = "<i4>" + payload + "</i4>"
+	}
 	_, _ = fmt.Fprintf(w, `<?xml version="1.0"?><methodResponse><params><param><value><array><data>`+
-		`<value><boolean>%d</boolean></value><value><string>%s</string></value><value><i4>%d</i4></value>`+
-		`</data></array></value></param></params></methodResponse>`, okValue, html.EscapeString(payload), errCode)
+		`<value><boolean>%d</boolean></value><value>%s</value><value><i4>%d</i4></value>`+
+		`</data></array></value></param></params></methodResponse>`, okValue, value, errCode)
 }
 
 func (f *fakeOneRPC) called(method string) bool {
@@ -158,7 +169,7 @@ func (f *fakeOneRPC) called(method string) bool {
 	return false
 }
 
-func newFakeOneProvider(t *testing.T, fake *fakeOneRPC) *PersistentDiskVolumeProvider {
+func newFakeOneProvider(t *testing.T, fake http.Handler) *PersistentDiskVolumeProvider {
 	t.Helper()
 	server := httptest.NewServer(fake)
 	t.Cleanup(server.Close)
