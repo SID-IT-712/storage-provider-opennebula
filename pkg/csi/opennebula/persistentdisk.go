@@ -179,7 +179,7 @@ func (p *PersistentDiskVolumeProvider) DeleteVolume(ctx context.Context, volume 
 	return nil
 }
 
-func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name string, sourceVolume string, selection DatastoreSelectionConfig) (*VolumeCreateResult, error) {
+func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name string, sourceVolume string, size int64, selection DatastoreSelectionConfig) (*VolumeCreateResult, error) {
 	if strings.TrimSpace(name) == "" {
 		return nil, fmt.Errorf("clone name cannot be empty")
 	}
@@ -187,7 +187,7 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 		return nil, fmt.Errorf("source volume cannot be empty")
 	}
 
-	sourceVolumeID, _, err := p.VolumeExists(ctx, sourceVolume)
+	sourceVolumeID, sourceSizeBytes, err := p.VolumeExists(ctx, sourceVolume)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve source volume %q: %w", sourceVolume, err)
 	}
@@ -195,22 +195,19 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 		return nil, fmt.Errorf("source volume %q was not found", sourceVolume)
 	}
 
-	sourceImage, err := p.ctrl.Image(sourceVolumeID).InfoContext(ctx, true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to inspect source volume %q: %w", sourceVolume, err)
-	}
-
 	candidates, err := p.resolveProvisioningDatastores(ctx, selection)
 	if err != nil {
 		return nil, err
 	}
 
-	sourceSizeBytes := int64(sourceImage.Size * sizeConversion)
+	// @gotcha: never size a clone from the source image's SIZE. That is OpenNebula's
+	//   canonical size, which an online or deferred grow leaves behind; VolumeExists is the real size.
+	cloneSizeBytes := effectiveVolumeSizeBytes(int64(sourceSizeBytes), size)
 	attemptedDatastores := make([]int, 0, len(candidates))
 	insufficientCapacity := make([]string, 0)
 	for _, datastore := range candidates {
 		attemptedDatastores = append(attemptedDatastores, datastore.ID)
-		if datastore.FreeBytes < sourceSizeBytes {
+		if datastore.FreeBytes < cloneSizeBytes {
 			recordDatastoreProvisioningResult(datastore.ID, false)
 			insufficientCapacity = append(insufficientCapacity, strconv.Itoa(datastore.ID))
 			continue
@@ -233,9 +230,22 @@ func (p *PersistentDiskVolumeProvider) CloneVolume(ctx context.Context, name str
 			return nil, fmt.Errorf("failed waiting for clone %d to become ready: %w", cloneID, err)
 		}
 
+		cloneImage, err := p.ctrl.Image(cloneID).InfoContext(ctx, true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to inspect clone %d: %w", cloneID, err)
+		}
+		// one.image.clone creates the clone at the source's canonical size, so a
+		// larger clone is recorded as a requested size, the same as a deferred
+		// expand: restoreAttachedVolumeRequestedSize grows the disk on the next attach.
+		if cloneSizeBytes > int64(cloneImage.Size)*sizeConversion {
+			if err := p.persistCSIRequestedSize(ctx, cloneID, name, cloneSizeBytes, bytesToMiBRoundUp(cloneSizeBytes)); err != nil {
+				return nil, fmt.Errorf("failed to record size of clone %d: %w", cloneID, err)
+			}
+		}
+
 		return &VolumeCreateResult{
 			Datastore:             datastore,
-			CapacityBytes:         sourceSizeBytes,
+			CapacityBytes:         cloneSizeBytes,
 			FallbackUsed:          len(attemptedDatastores) > 1,
 			AttemptedDatastoreIDs: append([]int(nil), attemptedDatastores...),
 		}, nil

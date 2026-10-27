@@ -722,7 +722,7 @@ func TestCreateVolumeClonesFromSourceVolume(t *testing.T) {
 	sharedProvider := &MockSharedFilesystemProviderTestify{}
 	cs := getTestControllerServerWithAllowedTypes(mockProvider, sharedProvider, "local")
 
-	mockProvider.On("CloneVolume", mock.Anything, "clone-volume", "source-volume", opennebula.DatastoreSelectionConfig{
+	mockProvider.On("CloneVolume", mock.Anything, "clone-volume", "source-volume", int64(1024*1024*1024), opennebula.DatastoreSelectionConfig{
 		Identifiers:  []string{"100"},
 		Policy:       opennebula.DatastoreSelectionPolicyLeastUsed,
 		AllowedTypes: []string{"local"},
@@ -2402,8 +2402,8 @@ func (m *MockOpenNebulaVolumeProviderTestify) ResolveProvisioningDatastores(ctx 
 	return args.Get(0).([]opennebula.Datastore), args.Error(1)
 }
 
-func (m *MockOpenNebulaVolumeProviderTestify) CloneVolume(ctx context.Context, name string, sourceVolume string, selection opennebula.DatastoreSelectionConfig) (*opennebula.VolumeCreateResult, error) {
-	args := m.Called(ctx, name, sourceVolume, selection)
+func (m *MockOpenNebulaVolumeProviderTestify) CloneVolume(ctx context.Context, name string, sourceVolume string, size int64, selection opennebula.DatastoreSelectionConfig) (*opennebula.VolumeCreateResult, error) {
+	args := m.Called(ctx, name, sourceVolume, size, selection)
 	if result := args.Get(0); result != nil {
 		return result.(*opennebula.VolumeCreateResult), args.Error(1)
 	}
