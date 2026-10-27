@@ -348,6 +348,9 @@ func (ns *NodeServer) recoverLocalDiskSession(ctx context.Context, session local
 	if err := ns.mounter.FormatAndMount(devicePath, session.StagingTargetPath, fsType, session.StageMountOptions); err != nil {
 		return ns.recordLocalDiskRecoveryFailure(session, fmt.Errorf("failed to remount recovered device %s at %s: %w", devicePath, session.StagingTargetPath, err))
 	}
+	if err := ns.growStagedFilesystem(session.VolumeID, devicePath, session.StagingTargetPath, fsType, session.StageMountOptions); err != nil {
+		return ns.recordLocalDiskRecoveryFailure(session, err)
+	}
 	for _, target := range session.PublishedTargets {
 		if err := os.MkdirAll(target.TargetPath, 0o750); err != nil {
 			return ns.recordLocalDiskRecoveryFailure(session, fmt.Errorf("failed to recreate target %s: %w", target.TargetPath, err))

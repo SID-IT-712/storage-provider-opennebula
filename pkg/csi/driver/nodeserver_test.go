@@ -120,6 +120,7 @@ func withTestDiskPath(t *testing.T) string {
 func TestStageVolume(t *testing.T) {
 	tempDir := t.TempDir()
 	diskPath := withTestDiskPath(t)
+	stubStageGrow(t, false, nil, nil)
 	err := os.WriteFile(filepath.Join(diskPath, "zero"), []byte("test"), 0o644)
 	assert.NoError(t, err)
 

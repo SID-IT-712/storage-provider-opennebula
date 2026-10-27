@@ -192,6 +192,7 @@ func TestKernelDeviceSerialFollowsSymlink(t *testing.T) {
 // already mounted from mountSource), and a recorded session for vol-1.
 func localDiskNode(t *testing.T, diskPath, mountSource string) (*NodeServer, *mount.FakeMounter, *recordingExec, string) {
 	t.Helper()
+	stubStageGrow(t, false, nil, nil)
 	staging := t.TempDir()
 	mounts := []mount.MountPoint{}
 	if mountSource != "" {
