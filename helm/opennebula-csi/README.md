@@ -425,7 +425,7 @@ At least one datastore source must be configured through `driver.defaultDatastor
 | Parameter | Description | Default | Required |
 | --- | --- | --- | --- |
 | `featureGates.compatibilityAwareSelection` | Enable compatibility-aware filtering for datastores such as `COMPATIBLE_SYS_DS`. | `true` | No |
-| `featureGates.detachedDiskExpansion` | Legacy compatibility gate passed to controller expansion. Detached persistent-disk expansion is rejected because image-level resize does not reliably update canonical image size. Attach the volume before expanding it. | `true` | No |
+| `featureGates.detachedDiskExpansion` | Allow expanding a persistent disk that is not attached to any VM. OpenNebula cannot resize a detached image in place (`one.image.update` does not change its canonical size), so the controller records the requested size on the image (`CSI_REQUESTED_SIZE_BYTES` / `CSI_REQUESTED_SIZE_MB`) and returns it as the new capacity; the next attach grows the disk to that size with `one.vm.diskresize` before `ControllerPublishVolume` returns, and the filesystem grows on the node after mount. When `false`, expanding a detached disk fails with `FailedPrecondition` until the volume is attached. | `true` | No |
 | `featureGates.cephfsExpansion` | Enable CephFS dynamic subvolume expansion. Stable and enabled by default in `v0.4.3`. | `true` | No |
 | `featureGates.cephfsSnapshots` | Enable CephFS snapshot RPC flows. | `false` | No |
 | `featureGates.cephfsClones` | Enable CephFS PVC clone and snapshot restore flows. | `false` | No |
