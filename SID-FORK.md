@@ -1,6 +1,6 @@
 # SID-IT-712 fork of OpenNebula/storage-provider-opennebula
 
-This fork exists to run **four fixes** that are not yet upstream, and to propose
+This fork exists to run **five fixes** that are not yet upstream, and to propose
 them upstream from the exact commits we run.
 
 ## Fix 1: reconciler driver filter
@@ -131,6 +131,39 @@ OpenNebula's `Image::clone_template` does).
 **Chart:** no change.
 **Upstreamable:** yes, one code-only `fix(controller):` commit.
 
+## Fix 5: NodeStage grows an existing filesystem to its device
+
+**What was wrong.** A clone requested larger than its source (a 3Gi clone of a
+2Gi source) bound at 3Gi, and `ControllerPublishVolume`'s
+`restoreAttachedVolumeRequestedSize` grew the disk to 3Gi (fix 4), but the pod saw
+a ~2Gi filesystem (lamp-lab01, image `sid-v0.2.0-4`, ops case 80 Phase F). The
+clone carries its source's filesystem. `NodeStageVolume` only ran
+`FormatAndMount`, which leaves an existing filesystem as it is, and Kubernetes calls
+`NodeExpandVolume` only when a PVC's size is raised after provisioning, never for a
+fresh volume. So nothing grew it.
+
+**What changed.** `growStagedFilesystem` (`pkg/csi/driver/nodeserver.go`) runs
+after a mount volume is staged: mount-utils `ResizeFs.NeedResize`, then `Resize`
+when the filesystem is smaller than its device. It is the same resizer, through
+the same `nodeResizeFS` seam and the same exec, that `NodeExpandVolume` uses, so it
+runs the node plugin image's own binaries, never the host's: `blockdev`, `blkid`,
+`dumpe2fs` and `resize2fs` for ext3/ext4, `xfs_io` and `xfs_growfs` (on the mount
+point) for xfs. All come from the `apk add` line in `Dockerfile` (`util-linux`,
+`e2fsprogs-extra`, `xfsprogs-extra`). It runs:
+- after a fresh `FormatAndMount`;
+- on the already-staged branch, so kubelet's retry after a failed grow grows it
+  instead of reporting success on a small filesystem;
+- after local RWO stale-mount recovery's own `FormatAndMount`
+  (`nodeserver_localdisk_recovery.go`).
+
+A failed check or grow fails NodeStage with `Internal` (recovery records a
+failure), and the mount is left for the retry. A filesystem that already fills its
+device is left alone. Block volumes and read-only (`ro`) stages are never grown.
+Tests: `nodeserver_stage_grow_test.go`. The fix-2 helper `localDiskNode` and
+`TestStageVolume` stub the resizer, because their fake execs script no `blockdev`.
+**Chart:** no change.
+**Upstreamable:** yes, one code-only `fix(node):` commit.
+
 ## Branches
 
 | Branch | What it is | Rule |
@@ -140,6 +173,7 @@ OpenNebula's `Image::clone_template` does).
 | `fix/restage-serial-check` | fix 2's PR branch (PR #1, base `sid/release`) | Fix 2 is three code-only `fix(node):` commits (code and tests, no fork files), so they can be cherry-picked onto fix 1 for an upstream PR. Merge PR #1 with a rebase or a merge commit, never a squash, so those commits stay separate from the `docs(sid):` commits on `sid/release`. |
 | `fix/detached-expansion-deferred` | fix 3's PR branch (base `sid/release`) | One code-only `fix(controller):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash, so the code commit stays cherry-pickable. |
 | `fix/clone-requested-size` | fix 4's PR branch (base `sid/release`) | One code-only `fix(controller):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
+| `fix/stage-resize-fs` | fix 5's PR branch (base `sid/release`) | One code-only `fix(node):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
 | `sid/release` | every fix **plus** this file and our workflows | Our deploy line. Images are built from here. Never merge it into a fix branch. |
 
 ## Images
@@ -164,7 +198,8 @@ OpenNebula's `Image::clone_template` does).
    `fix(node): never fall back from a kernel serial match ...`), and the fork-only
    commits (this file, the workflows), and fix 3's
    `fix(controller): defer detached disk expansion to the next attach`, and fix 4's
-   `fix(controller): size clones from the effective source size`. Before tagging, check that
+   `fix(controller): size clones from the effective source size`, and fix 5's
+   `fix(node): grow an existing filesystem to its device on stage`. Before tagging, check that
    `git log --oneline <new-tag>..sid/release` still lists all three fix-2 commits. If one
    is dropped, the re-stage failure and the alias path come back silently.
 3. For an upstream PR of fix 2, cherry-pick all three commits, in order, onto the
@@ -173,6 +208,7 @@ OpenNebula's `Image::clone_template` does).
    `go test ./pkg/csi/driver/ -count=1 -run '^(TestKernelDeviceSerial|TestSidLab|TestIdentifyDevice|TestResolve|TestLocate|TestByIDNameHasSerial|TestNodeDeviceResolver|TestRequireSerialProof|TestStageVolumeRestage|TestStageVolumeNeverUsesAlias|TestStageVolumeRefusesSerialRequestWithoutResolver|TestStageVolumeByIDProof|TestStageVolumeAmbiguous|TestStageVolumeKeepsLocalDeviceReport|TestBlockPublishRefuses|TestReportAgrees|TestClassifyDeviceSerialMoved|TestRecoverySequence)'`.
    Then fix 3's: `go test ./pkg/csi/opennebula/ -count=1 -run '^(TestExpandDetachedVolume|TestAttachAfterDeferredExpand)'`.
    Then fix 4's: `go test ./pkg/csi/opennebula/ -count=1 -run '^TestClone'`.
+   Then fix 5's: `go test ./pkg/csi/driver/ -count=1 -run '^(TestStageVolumeGrows|TestStageVolumeLeaves|TestStageVolumeFailsWhenGrow|TestStageVolumeRestageGrows|TestStageVolumeBlockNeverGrows|TestStageVolumeReadOnlyNeverGrows|TestLocalDiskRecovery)'`.
    Then tag `sid-v<new-upstream>-1`.
 5. If upstream has merged an equivalent fix, retire this fork: pin upstream's image
    in our deployment tooling, and trust its repository to run the reconciler only
