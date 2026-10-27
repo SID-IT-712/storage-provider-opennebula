@@ -51,6 +51,9 @@ var (
 	nodeResizeFS       = func(exec utilexec.Interface, devicePath, deviceMountPath string) (bool, error) {
 		return mount.NewResizeFs(exec).Resize(devicePath, deviceMountPath)
 	}
+	nodeNeedResizeFS = func(exec utilexec.Interface, devicePath, deviceMountPath string) (bool, error) {
+		return mount.NewResizeFs(exec).NeedResize(devicePath, deviceMountPath)
+	}
 )
 
 const (
@@ -248,6 +251,12 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 			return nil, status.Error(codes.AlreadyExists, "volume capability is not compatible with the volume")
 		}
 
+		// A previous stage may have mounted the filesystem and then failed to grow it;
+		// kubelet's retry lands here, so the grow is re-checked before reporting success.
+		if err := ns.growStagedFilesystem(volumeID, devicePath, stagingTargetPath, fsType, mountFlags); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+
 		//Check if volume_id is already staged in stagingTargetPath and is identical
 		// to the volumeCapability provided in the request, then return 0 OK response
 		ns.recordLocalDiskStageSession(req, devicePath, fsType, mountFlags)
@@ -278,6 +287,12 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 			"method", "NodeStageVolume", "devicePath", devicePath,
 			"stagingTargetPath", stagingTargetPath, "fsType", fsType)
 		return nil, status.Errorf(codes.Internal, "failed to format and mount volume: %s", err)
+	}
+
+	// The mount is left in place on a grow failure: kubelet retries NodeStage, which
+	// takes the already-staged branch above and re-runs the grow.
+	if err := ns.growStagedFilesystem(volumeID, devicePath, stagingTargetPath, fsType, mountFlags); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
 	}
 
 	ns.Driver.metrics.RecordNodeStageDuration("disk", "success", time.Since(started))
@@ -841,6 +856,57 @@ func (ns *NodeServer) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVol
 			"attempt", attempts)
 		nodeDeviceSleep(policy.retryInterval)
 	}
+}
+
+// growStagedFilesystem grows an existing filesystem to fill its device once it is
+// mounted at stagingPath. Kubernetes calls NodeExpandVolume only for a PVC whose
+// size was raised after provisioning, never for a fresh one, so a filesystem that
+// arrives smaller than its device (a clone requested larger than its source, which
+// ControllerPublish grows to the requested size) is grown here or never.
+// It uses the same mount-utils resizer, and therefore the same binaries inside the
+// node plugin container, as NodeExpandVolume: blockdev, blkid, dumpe2fs and
+// resize2fs for ext3/ext4, xfs_io and xfs_growfs (on the mount point) for xfs.
+// It is idempotent: a filesystem that already fills its device is left alone.
+func (ns *NodeServer) growStagedFilesystem(volumeID, devicePath, stagingPath, fsType string, mountFlags []string) error {
+	// mount-utils' resizer exists only in its linux build; NodeExpandVolume has the same guard.
+	if nodeRuntimeGOOS != "linux" {
+		return nil
+	}
+	for _, flag := range mountFlags {
+		if flag == "ro" {
+			klog.V(1).InfoS("Not growing a read-only staged filesystem",
+				"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath, "stagingTargetPath", stagingPath)
+			return nil
+		}
+	}
+
+	needResize, err := nodeNeedResizeFS(ns.mounter.Exec, devicePath, stagingPath)
+	if err != nil {
+		klog.V(0).ErrorS(err, "Failed to compare staged filesystem size with its device",
+			"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath,
+			"stagingTargetPath", stagingPath, "fsType", fsType)
+		return fmt.Errorf("failed to check whether the filesystem of volume %s on %s needs to grow: %v", volumeID, devicePath, err)
+	}
+	if !needResize {
+		return nil
+	}
+
+	fsBytesBefore, _ := ns.filesystemSizeBytes(stagingPath)
+	klog.V(1).InfoS("Staged filesystem is smaller than its device, growing it",
+		"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath,
+		"stagingTargetPath", stagingPath, "fsType", fsType, "filesystemBytes", fsBytesBefore)
+	if _, err := nodeResizeFS(ns.mounter.Exec, devicePath, stagingPath); err != nil {
+		klog.V(0).ErrorS(err, "Failed to grow staged filesystem to its device",
+			"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath,
+			"stagingTargetPath", stagingPath, "fsType", fsType)
+		return fmt.Errorf("failed to grow the filesystem of volume %s on %s to its device: %v", volumeID, devicePath, err)
+	}
+	fsBytesAfter, _ := ns.filesystemSizeBytes(stagingPath)
+	klog.V(1).InfoS("Grew staged filesystem to its device",
+		"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath,
+		"stagingTargetPath", stagingPath, "fsType", fsType,
+		"filesystemBytesBefore", fsBytesBefore, "filesystemBytesAfter", fsBytesAfter)
+	return nil
 }
 
 type nodeExpandPolicy struct {
