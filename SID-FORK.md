@@ -1,6 +1,6 @@
 # SID-IT-712 fork of OpenNebula/storage-provider-opennebula
 
-This fork exists to run **three fixes** that are not yet upstream, and to propose
+This fork exists to run **four fixes** that are not yet upstream, and to propose
 them upstream from the exact commits we run.
 
 ## Fix 1: reconciler driver filter
@@ -104,6 +104,33 @@ unchanged. Tests: `persistentdisk_detached_expand_test.go` (an XML-RPC fake).
 **Chart:** README line for the gate only.
 **Upstreamable:** yes, one code-only `fix(controller):` commit.
 
+## Fix 4: a clone is sized from the source's effective size
+
+**What was wrong.** `CloneVolume` (`pkg/csi/opennebula/persistentdisk.go`)
+returned the source image's `SIZE` as the clone's CSI capacity and ignored the
+requested capacity. `SIZE` is OpenNebula's canonical size, which an online grow or
+a deferred detached grow (fix 3) leaves at the old value. OpenNebula's
+`one.image.clone` copies the source's template, so a grown source's
+`CSI_REQUESTED_SIZE_*` reached the clone and its next attach did grow the disk,
+but `CreateVolume` reported the old size. Kubernetes requests a clone at least as
+large as its source PVC, so cloning a grown PVC, or asking for a larger clone,
+returned less capacity than requested (the external-provisioner treats that as a
+failed create). A larger clone also never recorded the larger size, so nothing
+grew it.
+
+**What changed.** The clone's size is the larger of the source's effective size
+(`VolumeExists`, canonical or requested) and the requested capacity. The datastore
+free-space check uses that size. If it is larger than the clone's canonical size,
+it is written to the clone as `CSI_REQUESTED_SIZE_BYTES` / `_MB`, the same as
+fix 3, and `restoreAttachedVolumeRequestedSize` grows the disk on the next attach.
+`CreateVolume` reports that size. A clone at the source's size is unchanged and
+writes no metadata. Snapshot restore on disk volumes is still `Unimplemented`, so
+it has no sizing path to fix. Tests: `persistentdisk_clone_size_test.go` (a
+multi-image XML-RPC fake whose clone copies the template and canonical SIZE, as
+OpenNebula's `Image::clone_template` does).
+**Chart:** no change.
+**Upstreamable:** yes, one code-only `fix(controller):` commit.
+
 ## Branches
 
 | Branch | What it is | Rule |
@@ -112,7 +139,8 @@ unchanged. Tests: `persistentdisk_detached_expand_test.go` (an XML-RPC fake).
 | `fix/reconciler-driver-filter` | **only** fix 1, one commit on upstream | Upstream-clean: no fork plumbing, no private references. This is what an upstream PR would come from. |
 | `fix/restage-serial-check` | fix 2's PR branch (PR #1, base `sid/release`) | Fix 2 is three code-only `fix(node):` commits (code and tests, no fork files), so they can be cherry-picked onto fix 1 for an upstream PR. Merge PR #1 with a rebase or a merge commit, never a squash, so those commits stay separate from the `docs(sid):` commits on `sid/release`. |
 | `fix/detached-expansion-deferred` | fix 3's PR branch (base `sid/release`) | One code-only `fix(controller):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash, so the code commit stays cherry-pickable. |
-| `sid/release` | both fixes **plus** this file and our workflows | Our deploy line. Images are built from here. Never merge it into a fix branch. |
+| `fix/clone-requested-size` | fix 4's PR branch (base `sid/release`) | One code-only `fix(controller):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
+| `sid/release` | every fix **plus** this file and our workflows | Our deploy line. Images are built from here. Never merge it into a fix branch. |
 
 ## Images
 
@@ -135,7 +163,8 @@ unchanged. Tests: `persistentdisk_detached_expand_test.go` (an XML-RPC fake).
    `fix(node): decide disk identity in one place ...` and
    `fix(node): never fall back from a kernel serial match ...`), and the fork-only
    commits (this file, the workflows), and fix 3's
-   `fix(controller): defer detached disk expansion to the next attach`. Before tagging, check that
+   `fix(controller): defer detached disk expansion to the next attach`, and fix 4's
+   `fix(controller): size clones from the effective source size`. Before tagging, check that
    `git log --oneline <new-tag>..sid/release` still lists all three fix-2 commits. If one
    is dropped, the re-stage failure and the alias path come back silently.
 3. For an upstream PR of fix 2, cherry-pick all three commits, in order, onto the
@@ -143,6 +172,7 @@ unchanged. Tests: `persistentdisk_detached_expand_test.go` (an XML-RPC fake).
 4. Run both regression suites, the reconciler filter and every fix-2 test:
    `go test ./pkg/csi/driver/ -count=1 -run '^(TestKernelDeviceSerial|TestSidLab|TestIdentifyDevice|TestResolve|TestLocate|TestByIDNameHasSerial|TestNodeDeviceResolver|TestRequireSerialProof|TestStageVolumeRestage|TestStageVolumeNeverUsesAlias|TestStageVolumeRefusesSerialRequestWithoutResolver|TestStageVolumeByIDProof|TestStageVolumeAmbiguous|TestStageVolumeKeepsLocalDeviceReport|TestBlockPublishRefuses|TestReportAgrees|TestClassifyDeviceSerialMoved|TestRecoverySequence)'`.
    Then fix 3's: `go test ./pkg/csi/opennebula/ -count=1 -run '^(TestExpandDetachedVolume|TestAttachAfterDeferredExpand)'`.
+   Then fix 4's: `go test ./pkg/csi/opennebula/ -count=1 -run '^TestClone'`.
    Then tag `sid-v<new-upstream>-1`.
 5. If upstream has merged an equivalent fix, retire this fork: pin upstream's image
    in our deployment tooling, and trust its repository to run the reconciler only
@@ -150,7 +180,7 @@ unchanged. Tests: `persistentdisk_detached_expand_test.go` (an XML-RPC fake).
 
 ## Chart
 
-We use upstream's own chart (`helm/opennebula-csi`) unchanged; neither fix touches it. Its default image,
+We use upstream's own chart (`helm/opennebula-csi`) unchanged; no fix changes its templates. Its default image,
 `nudevco/opennebula-csi:v0.5.15`, is a third-party build. Always set
 `image.repository` and `image.tag`. Set the reconciler flag with `--set-string`: the
 chart reads it through `| default true`, and a boolean `false` renders as `"true"`.
