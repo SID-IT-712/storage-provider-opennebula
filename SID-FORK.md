@@ -1,6 +1,6 @@
 # SID-IT-712 fork of OpenNebula/storage-provider-opennebula
 
-This fork exists to run **two fixes** that are not yet upstream, and to propose
+This fork exists to run **three fixes** that are not yet upstream, and to propose
 them upstream from the exact commits we run.
 
 ## Fix 1: reconciler driver filter
@@ -85,6 +85,25 @@ reach the serial check.
 **Chart:** no change.
 **Upstreamable:** yes. The code is upstream's (v0.2.0) and the change is generic.
 
+## Fix 3: detached disk expansion is deferred to the next attach
+
+**What was wrong.** `ControllerExpandVolume` on a persistent disk attached to no
+VM failed `FailedPrecondition: ... not supported because one.image.update does
+not change canonical image size`, even with `featureGates.detachedDiskExpansion`
+on (the chart default). The external-resizer backed off, and the grow landed only
+if a pod attached in time (SID-IT-712/k8s-provisioner#479).
+
+**What changed.** With the gate on, `ExpandVolume`
+(`pkg/csi/opennebula/persistentdisk.go`) records the requested size on the image
+(`CSI_REQUESTED_SIZE_BYTES` / `_MB`, a template update only) and returns it. The
+existing attach path, `restoreAttachedVolumeRequestedSize`, grows the disk to it
+with `one.vm.diskresize` before `ControllerPublishVolume` returns, and fails the
+attach if it cannot. `VolumeExists` already reports the larger of canonical and
+requested size, so a retried expand is a no-op. With the gate off the refusal is
+unchanged. Tests: `persistentdisk_detached_expand_test.go` (an XML-RPC fake).
+**Chart:** README line for the gate only.
+**Upstreamable:** yes, one code-only `fix(controller):` commit.
+
 ## Branches
 
 | Branch | What it is | Rule |
@@ -92,6 +111,7 @@ reach the serial check.
 | `master` | upstream, untouched | Never commit here. Sync from `upstream/master`. |
 | `fix/reconciler-driver-filter` | **only** fix 1, one commit on upstream | Upstream-clean: no fork plumbing, no private references. This is what an upstream PR would come from. |
 | `fix/restage-serial-check` | fix 2's PR branch (PR #1, base `sid/release`) | Fix 2 is three code-only `fix(node):` commits (code and tests, no fork files), so they can be cherry-picked onto fix 1 for an upstream PR. Merge PR #1 with a rebase or a merge commit, never a squash, so those commits stay separate from the `docs(sid):` commits on `sid/release`. |
+| `fix/detached-expansion-deferred` | fix 3's PR branch (base `sid/release`) | One code-only `fix(controller):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash, so the code commit stays cherry-pickable. |
 | `sid/release` | both fixes **plus** this file and our workflows | Our deploy line. Images are built from here. Never merge it into a fix branch. |
 
 ## Images
@@ -114,13 +134,15 @@ reach the serial check.
    fix 2's three code commits (`fix(node): prove disk identity by kernel serial ...`,
    `fix(node): decide disk identity in one place ...` and
    `fix(node): never fall back from a kernel serial match ...`), and the fork-only
-   commits (this file, the workflows). Before tagging, check that
+   commits (this file, the workflows), and fix 3's
+   `fix(controller): defer detached disk expansion to the next attach`. Before tagging, check that
    `git log --oneline <new-tag>..sid/release` still lists all three fix-2 commits. If one
    is dropped, the re-stage failure and the alias path come back silently.
 3. For an upstream PR of fix 2, cherry-pick all three commits, in order, onto the
    rebased fix-1 branch. They carry no fork files.
 4. Run both regression suites, the reconciler filter and every fix-2 test:
    `go test ./pkg/csi/driver/ -count=1 -run '^(TestKernelDeviceSerial|TestSidLab|TestIdentifyDevice|TestResolve|TestLocate|TestByIDNameHasSerial|TestNodeDeviceResolver|TestRequireSerialProof|TestStageVolumeRestage|TestStageVolumeNeverUsesAlias|TestStageVolumeRefusesSerialRequestWithoutResolver|TestStageVolumeByIDProof|TestStageVolumeAmbiguous|TestStageVolumeKeepsLocalDeviceReport|TestBlockPublishRefuses|TestReportAgrees|TestClassifyDeviceSerialMoved|TestRecoverySequence)'`.
+   Then fix 3's: `go test ./pkg/csi/opennebula/ -count=1 -run '^(TestExpandDetachedVolume|TestAttachAfterDeferredExpand)'`.
    Then tag `sid-v<new-upstream>-1`.
 5. If upstream has merged an equivalent fix, retire this fork: pin upstream's image
    in our deployment tooling, and trust its repository to run the reconciler only
