@@ -133,20 +133,29 @@ func (f *fakeOneRPC) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // serveFakeXMLRPC decodes one XML-RPC call, hands it to handle and writes
 // OpenNebula's [ok, body, error code] response.
 func serveFakeXMLRPC(w http.ResponseWriter, r *http.Request, handle func(xmlRPCCall) (bool, string)) {
+	serveFakeXMLRPCWithCode(w, r, func(call xmlRPCCall) (bool, string, int) {
+		ok, payload := handle(call)
+		return ok, payload, 4096
+	})
+}
+
+// serveFakeXMLRPCWithCode is serveFakeXMLRPC with the OpenNebula error code of a
+// failed call chosen by the handler (for example 0x0400 NO_EXISTS).
+func serveFakeXMLRPCWithCode(w http.ResponseWriter, r *http.Request, handle func(xmlRPCCall) (bool, string, int)) {
 	body, _ := io.ReadAll(r.Body)
 	var call xmlRPCCall
 	if err := xml.Unmarshal(body, &call); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	ok, payload := handle(call)
+	ok, payload, failCode := handle(call)
 	okValue := 0
 	if ok {
 		okValue = 1
 	}
 	errCode := 0
 	if !ok {
-		errCode = 4096
+		errCode = failCode
 	}
 	// OpenNebula returns an ID (clone, allocate) as an int, everything else as a string.
 	value := "<string>" + html.EscapeString(payload) + "</string>"

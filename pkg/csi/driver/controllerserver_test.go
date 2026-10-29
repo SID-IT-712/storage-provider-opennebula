@@ -2564,6 +2564,16 @@ func (m *MockOpenNebulaVolumeProviderTestify) InspectVolumeAttachment(ctx contex
 	return nil, args.Error(1)
 }
 
+func (m *MockOpenNebulaVolumeProviderTestify) PoweroffVMHard(ctx context.Context, vmID int, timeout time.Duration) error {
+	args := m.Called(ctx, vmID, timeout)
+	return args.Error(0)
+}
+
+func (m *MockOpenNebulaVolumeProviderTestify) DetachVolumeFromStoppedVM(ctx context.Context, volume string, vmID int, timeout time.Duration) error {
+	args := m.Called(ctx, volume, vmID, timeout)
+	return args.Error(0)
+}
+
 func (m *MockOpenNebulaVolumeProviderTestify) InspectHostArtifactAttachmentTarget(ctx context.Context, volume string, node string, params map[string]string) (*opennebula.HostArtifactAttachmentTarget, error) {
 	if !m.hasExpectation("InspectHostArtifactAttachmentTarget") {
 		return nil, nil

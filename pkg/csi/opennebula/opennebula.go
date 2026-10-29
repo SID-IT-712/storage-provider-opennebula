@@ -61,6 +61,22 @@ type VolumeDiskRecord struct {
 	DiskID   int    `json:"diskID,omitempty"`
 	Target   string `json:"target,omitempty"`
 	Serial   string `json:"serial,omitempty"`
+	VMState  string `json:"vmState,omitempty"`
+	LCMState string `json:"lcmState,omitempty"`
+}
+
+// OwnerVMRecord is what InspectVolumeAttachment learned about one VM that
+// metadata says owns the volume: from the image's VMS list or a VM disk record.
+// VMState and LCMState are OpenNebula's state strings (POWEROFF, ACTIVE/UNKNOWN,
+// DONE). Deleted means OpenNebula answered NO_EXISTS for the VM ID. LookupError
+// is set when the state could not be read; such an owner is never treated as dead.
+type OwnerVMRecord struct {
+	VMID        int    `json:"vmID"`
+	Name        string `json:"name,omitempty"`
+	VMState     string `json:"vmState,omitempty"`
+	LCMState    string `json:"lcmState,omitempty"`
+	Deleted     bool   `json:"deleted,omitempty"`
+	LookupError string `json:"lookupError,omitempty"`
 }
 
 type VolumeAttachmentMetadata struct {
@@ -75,6 +91,17 @@ type VolumeAttachmentMetadata struct {
 	RequestedNodeID         int                `json:"requestedNodeID,omitempty"`
 	AttachedToRequestedNode bool               `json:"attachedToRequestedNode,omitempty"`
 	DiskRecords             []VolumeDiskRecord `json:"diskRecords,omitempty"`
+	OwnerVMs                []OwnerVMRecord    `json:"ownerVMs,omitempty"`
+}
+
+// OwnerVM returns the state record for one conflicting owner VM ID.
+func (m VolumeAttachmentMetadata) OwnerVM(vmID int) (OwnerVMRecord, bool) {
+	for _, owner := range m.OwnerVMs {
+		if owner.VMID == vmID {
+			return owner, true
+		}
+	}
+	return OwnerVMRecord{}, false
 }
 
 func (m VolumeAttachmentMetadata) ConflictingOwnerVMIDs() []int {
@@ -101,6 +128,19 @@ func (m VolumeAttachmentMetadata) ConflictingOwnerVMIDs() []int {
 
 type VolumeAttachmentInspector interface {
 	InspectVolumeAttachment(ctx context.Context, volume string, node string) (*VolumeAttachmentMetadata, error)
+}
+
+// DeadOwnerRecoverer releases a volume from an owner VM that is provably not
+// running. Neither method ever polls the VM for readiness: a stopped VM is never
+// RUNNING, so a readiness wait could only time out.
+type DeadOwnerRecoverer interface {
+	// PoweroffVMHard sends poweroff-hard to the VM (unless it is already
+	// POWEROFF) and waits until OpenNebula reports POWEROFF.
+	PoweroffVMHard(ctx context.Context, vmID int, timeout time.Duration) error
+	// DetachVolumeFromStoppedVM detaches the volume's disk from a VM that is
+	// POWEROFF and waits until the disk is gone from the VM template. It refuses
+	// a VM in any other state.
+	DetachVolumeFromStoppedVM(ctx context.Context, volume string, vmID int, timeout time.Duration) error
 }
 
 type HotplugCooldownState struct {

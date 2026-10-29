@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -57,7 +58,28 @@ func (s *ControllerServer) rejectIfOpenNebulaMetadataDrift(ctx context.Context, 
 		return nil
 	}
 
+	recovered, recoveryErr := s.resolveDeadOwners(ctx, req.VolumeId, req.NodeId, metadata)
+	if recovered {
+		if quarantined {
+			if err := s.driver.volumeQuarantine.Clear(ctx, req.VolumeId); err != nil {
+				klog.V(2).InfoS("Failed to clear volume quarantine after dead-owner recovery", "volumeID", req.VolumeId, "err", err)
+			} else {
+				s.driver.metrics.RecordVolumeQuarantine(activeState.Reason, "cleared")
+			}
+		}
+		s.recordDeadOwnerRecovered(ctx, runtimeCtx, req.VolumeId, req.NodeId, metadata)
+		return nil
+	}
+
+	if errors.Is(recoveryErr, errDeadOwnerNodeBusy) {
+		// Not a drift verdict: the owners are dead but their node is busy. Retry.
+		return status.Errorf(codes.Unavailable, "dead-owner recovery of local RWO volume %s deferred: %v", req.VolumeId, recoveryErr)
+	}
+
 	message := metadataDriftMessage(metadata, req.VolumeId, req.NodeId)
+	if recoveryErr != nil {
+		message = fmt.Sprintf("%s; dead-owner recovery not applied: %v", message, recoveryErr)
+	}
 	state := VolumeQuarantineState{
 		VolumeID:       req.VolumeId,
 		Reason:         metadataDriftReason,
@@ -226,6 +248,9 @@ func diskRecordSummary(records []opennebula.VolumeDiskRecord) string {
 		}
 		if strings.TrimSpace(record.Serial) != "" {
 			fields = append(fields, "serial="+record.Serial)
+		}
+		if strings.TrimSpace(record.VMState) != "" {
+			fields = append(fields, "state="+vmStateLabel(record.VMState, record.LCMState))
 		}
 		parts = append(parts, strings.Join(fields, "/"))
 	}

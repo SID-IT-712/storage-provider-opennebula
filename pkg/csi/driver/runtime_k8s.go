@@ -420,6 +420,28 @@ func (r *KubeRuntime) NodeHealth(ctx context.Context, nodeName string) (Kubernet
 	return health, nil
 }
 
+// NodeHasTaint reports whether the Kubernetes Node carries a taint with the
+// given key, whatever its value or effect. A missing Node is an error, never
+// "no taint", so a caller deciding on the taint fails closed.
+func (r *KubeRuntime) NodeHasTaint(ctx context.Context, nodeName, taintKey string) (bool, error) {
+	if r == nil || !r.enabled {
+		return false, fmt.Errorf("kubernetes runtime is not enabled")
+	}
+	if strings.TrimSpace(nodeName) == "" {
+		return false, fmt.Errorf("node name is required")
+	}
+	node, err := r.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	for _, taint := range node.Spec.Taints {
+		if taint.Key == taintKey {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (r *KubeRuntime) OpenNebulaNode(ctx context.Context, nodeName string) (*inventoryv1alpha1.OpenNebulaNode, error) {
 	if r == nil || !r.enabled || r.inventoryClient == nil {
 		return nil, fmt.Errorf("inventory runtime is not enabled")
