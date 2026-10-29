@@ -2189,6 +2189,11 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 	}
 
 	oldNodeID, oldNodeErr := s.volumeProvider.NodeExists(ctx, state.NodeID)
+	if oldNodeErr != nil || oldNodeID == -1 {
+		if s.releaseStickyFromGoneNode(ctx, req, state) {
+			return false, nil, nil
+		}
+	}
 	if oldNodeErr == nil && oldNodeID != -1 {
 		if _, oldAttachErr := s.volumeProvider.GetVolumeInNode(ctx, volumeID, oldNodeID); oldAttachErr != nil {
 			if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
@@ -2220,6 +2225,52 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 	s.driver.metrics.RecordStickyDetachResidency("cancelled", time.Since(state.StartedAt))
 	s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceCancelled, fmt.Sprintf("cancelled delayed detach for volume %s and detached from node %s before publishing to node %s", req.VolumeId, state.NodeID, req.NodeId))
 	return false, nil, nil
+}
+
+// releaseStickyFromGoneNode handles a sticky attachment whose old node no
+// longer resolves to a VM. DetachVolume addresses the VM by node name, so it can
+// only fail there. Instead the volume's owners are inspected: with no owner left
+// the sticky state is stale, and dead owners are released as on the publish
+// path. It returns true when the publish may proceed; false keeps the old path.
+func (s *ControllerServer) releaseStickyFromGoneNode(ctx context.Context, req *csi.ControllerPublishVolumeRequest, state StickyAttachmentState) bool {
+	// The same gates as the publish-path drift check: no recovery where that
+	// check would not run.
+	if !s.deadOwnerRecoveryEnabled() || !s.metadataDriftQuarantineEnabled() {
+		return false
+	}
+	if _, eligible := s.metadataDriftGuardEligible(ctx, req.VolumeId); !eligible {
+		return false
+	}
+	inspector, ok := s.volumeProvider.(opennebula.VolumeAttachmentInspector)
+	if !ok {
+		return false
+	}
+	metadata, err := inspector.InspectVolumeAttachment(ctx, req.VolumeId, req.NodeId)
+	if err != nil || metadata == nil {
+		klog.V(2).InfoS("Failed to inspect attachment metadata for a sticky volume whose old node is gone", "volumeID", req.VolumeId, "oldNode", state.NodeID, "err", err)
+		return false
+	}
+	if attachmentMetadataDriftDetected(metadata) {
+		recovered, recoveryErr := s.resolveDeadOwners(ctx, req.VolumeId, req.NodeId, metadata, state.NodeID)
+		if !recovered {
+			klog.V(1).InfoS("Sticky volume's old node is gone but its owners are not provably dead", "volumeID", req.VolumeId, "oldNode", state.NodeID, "err", recoveryErr)
+			return false
+		}
+		s.driver.metrics.RecordMetadataDrift(metadataDriftClassification, metadataDriftOutcomeRecoveredDeadOwner)
+		s.recordPVCEventFromStickyState(ctx, state, eventReasonOpenNebulaDeadOwnerRecovered,
+			fmt.Sprintf("released local RWO volume %s from dead owner VM(s) of gone node %s before publishing to node %s", req.VolumeId, state.NodeID, req.NodeId))
+	}
+	if err := s.driver.stickyAttachments.Clear(req.VolumeId); err != nil {
+		klog.V(1).InfoS("Failed to clear sticky attachment state for a gone node", "volumeID", req.VolumeId, "err", err)
+		return false
+	}
+	if s.driver.volumeQuarantine != nil {
+		_ = s.driver.volumeQuarantine.Clear(ctx, req.VolumeId)
+	}
+	s.driver.metrics.RecordStickyDetach("old_node_gone", state.Reason)
+	s.driver.metrics.RecordStickyDetachResidency("old_node_gone", time.Since(state.StartedAt))
+	s.recordPVCEventFromStickyState(ctx, state, eventReasonDetachGraceCancelled, fmt.Sprintf("cleared sticky attachment state for volume %s because old node %s no longer exists", req.VolumeId, state.NodeID))
+	return true
 }
 
 func (s *ControllerServer) expireStickyDetach(ctx context.Context, state StickyAttachmentState) {

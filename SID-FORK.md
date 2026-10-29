@@ -1,6 +1,6 @@
 # SID-IT-712 fork of OpenNebula/storage-provider-opennebula
 
-This fork exists to run **five fixes** that are not yet upstream, and to propose
+This fork exists to run **six fixes** that are not yet upstream, and to propose
 them upstream from the exact commits we run.
 
 ## Fix 1: reconciler driver filter
@@ -164,6 +164,67 @@ Tests: `nodeserver_stage_grow_test.go`. The fix-2 helper `localDiskNode` and
 **Chart:** no change.
 **Upstreamable:** yes, one code-only `fix(node):` commit.
 
+## Fix 6: re-attach an RWO volume from a dead owner VM
+
+**What was wrong.** When a node died, its local RWO volumes stayed recorded on
+the dead VM: the image's VMS list and the VM template's DISK both still named
+it. The rescheduled pod's `ControllerPublishVolume` saw that as metadata drift
+(`rejectIfOpenNebulaMetadataDrift`, `pkg/csi/driver/metadata_drift.go`) and
+refused with "external OpenNebula repair is required", whatever state the old
+VM was in. So a pod that needs one RWO volume could never follow its node to
+another one without a hand-run `onevm disk-detach`. The sticky-attachment path
+(`reuseStickyAttachment`) had no way out at all once the old node's VM no longer
+resolved: `DetachVolume` looks the VM up by node name, so it could only fail.
+
+**What changed.** Before the drift check refuses, it tries to resolve owners
+that are provably dead (`resolveDeadOwners`, `pkg/csi/driver/dead_owner_recovery.go`):
+- `InspectVolumeAttachment` (`pkg/csi/opennebula/persistentdisk.go`) records
+  each conflicting owner VM's state (`OwnerVMRecord`, and `VMState` / `LCMState`
+  on each disk record). The default VM pool listing leaves DONE VMs out, so an
+  owner missing from the pool is read by ID. Only a `NO_EXISTS` answer marks it
+  deleted. Any other failure is a lookup error.
+- Every owner is classified before any is touched:
+  - POWEROFF: the disk is detached.
+  - ACTIVE/UNKNOWN, and the Kubernetes Node of the same name carries
+    `node.kubernetes.io/out-of-service`: the VM is hard powered off
+    (`one.vm.action poweroff-hard`), the driver waits for POWEROFF, then the
+    disk is detached.
+  - DONE or deleted: nothing to detach.
+  - Anything else refuses the whole publish, with no action on any owner:
+    RUNNING, any other state, an unreadable state, an UNKNOWN owner whose Node
+    has no taint or cannot be read, or an owner with no state record.
+- The detach (`DetachVolumeFromStoppedVM`, `pkg/csi/opennebula/dead_owner.go`)
+  addresses the VM by ID. It re-checks POWEROFF itself and waits only for the
+  disk to leave the template. It never polls `nodeReady`, which needs the VM
+  RUNNING. `PoweroffVMHard` re-checks UNKNOWN before acting, and ends its wait
+  early if the VM comes back RUNNING or reaches a `*_FAILURE` state.
+- A fresh inspection must then show no owner except DONE or deleted ones.
+  Otherwise the publish is refused.
+- A refusal keeps the old message, with the reason appended, and the old
+  quarantine bookkeeping. A recovery clears an active quarantine, counts
+  `opennebula_csi_metadata_drift_total{outcome="recovered_dead_owner"}` and
+  emits a PVC event `OpenNebulaDeadOwnerRecovered`.
+- Owner node locks are taken with `TryAcquire`, because the volume lock is
+  already held and other paths take the node lock first. A busy owner node
+  returns `Unavailable` (the publish is retried), not a drift observation.
+- `reuseStickyAttachment`: when the old node no longer resolves to a VM, the
+  volume is inspected. With no owner left, the stale sticky state is cleared and
+  the publish proceeds. With dead owners, they are released as above. Otherwise
+  it takes the old path.
+- Kill switch: `ONE_CSI_METADATA_DRIFT_DEAD_OWNER_RECOVERY=false` (default
+  `true`) restores the old behaviour on both paths. Set it through
+  `controller.extraEnv`.
+
+Tests: `pkg/csi/driver/dead_owner_recovery_test.go` (publish and sticky paths
+against the mock provider) and `pkg/csi/opennebula/dead_owner_test.go` (an
+XML-RPC fake with OpenNebula error codes; `serveFakeXMLRPC` gained a
+`WithCode` variant).
+**Chart:** no change. The kill switch is an env var on `controller.extraEnv`.
+**Upstreamable:** yes, one code-only `fix(controller):` commit. Not yet proven
+live: a hard power-off from UNKNOWN, and a detach from POWEROFF, both need
+OpenNebula to reach the VM's host, so recovery from a host that is still
+unreachable may time out and refuse. It fails closed either way.
+
 ## Branches
 
 | Branch | What it is | Rule |
@@ -174,6 +235,7 @@ Tests: `nodeserver_stage_grow_test.go`. The fix-2 helper `localDiskNode` and
 | `fix/detached-expansion-deferred` | fix 3's PR branch (base `sid/release`) | One code-only `fix(controller):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash, so the code commit stays cherry-pickable. |
 | `fix/clone-requested-size` | fix 4's PR branch (base `sid/release`) | One code-only `fix(controller):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
 | `fix/stage-resize-fs` | fix 5's PR branch (base `sid/release`) | One code-only `fix(node):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
+| `fix/dead-owner-reattach` | fix 6's PR branch (base `sid/release`) | One code-only `fix(controller):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
 | `sid/release` | every fix **plus** this file and our workflows | Our deploy line. Images are built from here. Never merge it into a fix branch. |
 
 ## Images
@@ -199,7 +261,8 @@ Tests: `nodeserver_stage_grow_test.go`. The fix-2 helper `localDiskNode` and
    commits (this file, the workflows), and fix 3's
    `fix(controller): defer detached disk expansion to the next attach`, and fix 4's
    `fix(controller): size clones from the effective source size`, and fix 5's
-   `fix(node): grow an existing filesystem to its device on stage`. Before tagging, check that
+   `fix(node): grow an existing filesystem to its device on stage`, and fix 6's
+   `fix(controller): re-attach an RWO volume from a dead owner VM`. Before tagging, check that
    `git log --oneline <new-tag>..sid/release` still lists all three fix-2 commits. If one
    is dropped, the re-stage failure and the alias path come back silently.
 3. For an upstream PR of fix 2, cherry-pick all three commits, in order, onto the
@@ -209,6 +272,7 @@ Tests: `nodeserver_stage_grow_test.go`. The fix-2 helper `localDiskNode` and
    Then fix 3's: `go test ./pkg/csi/opennebula/ -count=1 -run '^(TestExpandDetachedVolume|TestAttachAfterDeferredExpand)'`.
    Then fix 4's: `go test ./pkg/csi/opennebula/ -count=1 -run '^TestClone'`.
    Then fix 5's: `go test ./pkg/csi/driver/ -count=1 -run '^(TestStageVolumeGrows|TestStageVolumeLeaves|TestStageVolumeFailsWhenGrow|TestStageVolumeRestageGrows|TestStageVolumeBlockNeverGrows|TestStageVolumeReadOnlyNeverGrows|TestLocalDiskRecovery)'`.
+   Then fix 6's: `go test ./pkg/csi/... -count=1 -run '^(TestDeadOwner|TestStickyOldNodeGone|TestNodeHasTaint|TestInspectVolumeAttachmentRecordsOwnerVMStates|TestPoweroffVMHard|TestDetachVolumeFromStoppedVM)'`.
    Then tag `sid-v<new-upstream>-1`.
 5. If upstream has merged an equivalent fix, retire this fork: pin upstream's image
    in our deployment tooling, and trust its repository to run the reconciler only

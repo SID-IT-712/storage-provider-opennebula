@@ -198,7 +198,7 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		}, []string{"operation", "reason"}),
 		metadataDriftTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "opennebula_csi_metadata_drift_total",
-			Help: "Total number of OpenNebula attachment metadata drift observations by classification and outcome.",
+			Help: "Total number of OpenNebula attachment metadata drift observations by classification and outcome (detected, detach_failed, recovered_dead_owner).",
 		}, []string{"classification", "outcome"}),
 		volumeQuarantineTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "opennebula_csi_volume_quarantine_total",

@@ -71,6 +71,7 @@ const (
 	MetadataDriftQuarantineEnabledVar          = "ONE_CSI_METADATA_DRIFT_QUARANTINE_ENABLED"
 	MetadataDriftQuarantineFailureThresholdVar = "ONE_CSI_METADATA_DRIFT_QUARANTINE_FAILURE_THRESHOLD"
 	MetadataDriftQuarantineTTLSecondsVar       = "ONE_CSI_METADATA_DRIFT_QUARANTINE_TTL_SECONDS"
+	MetadataDriftDeadOwnerRecoveryVar          = "ONE_CSI_METADATA_DRIFT_DEAD_OWNER_RECOVERY"
 	HostArtifactQuarantineEnabledVar           = "ONE_CSI_HOST_ARTIFACT_QUARANTINE_ENABLED"
 	HostArtifactQuarantineFailureThresholdVar  = "ONE_CSI_HOST_ARTIFACT_QUARANTINE_FAILURE_THRESHOLD"
 	HostArtifactQuarantineTTLSecondsVar        = "ONE_CSI_HOST_ARTIFACT_QUARANTINE_TTL_SECONDS"
@@ -157,6 +158,7 @@ const (
 	defaultMetadataDriftQuarantineEnabled          = true
 	defaultMetadataDriftQuarantineFailureThreshold = 2
 	defaultMetadataDriftQuarantineTTLSeconds       = 1800
+	defaultMetadataDriftDeadOwnerRecovery          = true
 	defaultHostArtifactQuarantineEnabled           = true
 	defaultHostArtifactQuarantineFailureThreshold  = 1
 	defaultHostArtifactQuarantineTTLSeconds        = 3600
@@ -271,6 +273,7 @@ func initViper() *viper.Viper {
 	viper.SetDefault(MetadataDriftQuarantineEnabledVar, defaultMetadataDriftQuarantineEnabled)
 	viper.SetDefault(MetadataDriftQuarantineFailureThresholdVar, defaultMetadataDriftQuarantineFailureThreshold)
 	viper.SetDefault(MetadataDriftQuarantineTTLSecondsVar, defaultMetadataDriftQuarantineTTLSeconds)
+	viper.SetDefault(MetadataDriftDeadOwnerRecoveryVar, defaultMetadataDriftDeadOwnerRecovery)
 	viper.SetDefault(HostArtifactQuarantineEnabledVar, defaultHostArtifactQuarantineEnabled)
 	viper.SetDefault(HostArtifactQuarantineFailureThresholdVar, defaultHostArtifactQuarantineFailureThreshold)
 	viper.SetDefault(HostArtifactQuarantineTTLSecondsVar, defaultHostArtifactQuarantineTTLSeconds)

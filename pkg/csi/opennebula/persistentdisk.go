@@ -18,6 +18,7 @@ package opennebula
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/OpenNebula/one/src/oca/go/src/goca"
+	goerrors "github.com/OpenNebula/one/src/oca/go/src/goca/errors"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/parameters"
 	datastoreSchema "github.com/OpenNebula/one/src/oca/go/src/goca/schemas/datastore"
 	"github.com/OpenNebula/one/src/oca/go/src/goca/schemas/image"
@@ -1779,7 +1781,10 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Conte
 	if err != nil {
 		return nil, fmt.Errorf("failed to list virtual machines while inspecting volume %d attachment metadata: %w", volumeID, err)
 	}
+	poolVMs := make(map[int]OwnerVMRecord, len(vmPool.VMs))
 	for _, vmInfo := range vmPool.VMs {
+		owner := ownerVMRecordFromVM(&vmInfo)
+		poolVMs[vmInfo.ID] = owner
 		for _, disk := range vmInfo.Template.GetDisks() {
 			diskImageID, diskErr := disk.GetI(shared.ImageID)
 			if diskErr != nil || diskImageID != volumeID {
@@ -1788,6 +1793,8 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Conte
 			record := VolumeDiskRecord{
 				NodeName: vmInfo.Name,
 				NodeID:   vmInfo.ID,
+				VMState:  owner.VMState,
+				LCMState: owner.LCMState,
 			}
 			if diskID, diskIDErr := disk.GetI(shared.DiskID); diskIDErr == nil {
 				record.DiskID = diskID
@@ -1805,7 +1812,42 @@ func (p *PersistentDiskVolumeProvider) InspectVolumeAttachment(ctx context.Conte
 		}
 	}
 
+	for _, ownerID := range metadata.ConflictingOwnerVMIDs() {
+		if owner, ok := poolVMs[ownerID]; ok {
+			metadata.OwnerVMs = append(metadata.OwnerVMs, owner)
+			continue
+		}
+		// The default pool listing leaves out DONE VMs, so an owner the image
+		// still lists may be DONE or gone. Ask for it by ID: NO_EXISTS proves it
+		// was deleted, any other failure leaves its state unknown.
+		metadata.OwnerVMs = append(metadata.OwnerVMs, p.lookupOwnerVM(ctx, ownerID))
+	}
+
 	return metadata, nil
+}
+
+func ownerVMRecordFromVM(vmInfo *vm.VM) OwnerVMRecord {
+	owner := OwnerVMRecord{VMID: vmInfo.ID, Name: vmInfo.Name}
+	state, lcmState, err := vmInfo.StateString()
+	if err != nil {
+		owner.LookupError = err.Error()
+		return owner
+	}
+	owner.VMState = state
+	owner.LCMState = lcmState
+	return owner
+}
+
+func (p *PersistentDiskVolumeProvider) lookupOwnerVM(ctx context.Context, vmID int) OwnerVMRecord {
+	vmInfo, err := p.ctrl.VM(vmID).InfoContext(ctx, false)
+	if err != nil {
+		var responseErr *goerrors.ResponseError
+		if errors.As(err, &responseErr) && responseErr.Code == goerrors.OneNoExistsError {
+			return OwnerVMRecord{VMID: vmID, Deleted: true}
+		}
+		return OwnerVMRecord{VMID: vmID, LookupError: err.Error()}
+	}
+	return ownerVMRecordFromVM(vmInfo)
 }
 
 func (p *PersistentDiskVolumeProvider) ListCurrentAttachments(ctx context.Context) ([]ObservedAttachment, error) {
