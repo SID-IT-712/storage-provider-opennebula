@@ -70,6 +70,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: false # post-step cache save hangs on the pool runners
 
       # The filter being present is not enough: prove it still does its job.
       - name: Regression test — a foreign driver's VolumeAttachment survives
