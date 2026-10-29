@@ -1,0 +1,42 @@
+# ci — lint and unit tests for the SID fork, on the in-cluster runner pool.
+# @why: GitHub-hosted runners are refused by billing in this org
+#   (SID-IT-712/cca-claude-code-helm-chart#457), so every job targets the pool.
+# @gotcha: `make lint` fetches golangci-lint with `go install`, so the runner
+#   needs only Go (actions/setup-go), not a preinstalled linter.
+name: ci
+
+on:
+  pull_request:
+    branches: [sid/release]
+  push:
+    branches: [sid/release]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: lint
+    runs-on: [self-hosted, sid-cluster]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - run: make lint
+
+  test:
+    name: test
+    runs-on: [self-hosted, sid-cluster]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - run: make test
