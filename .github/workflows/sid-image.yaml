@@ -36,7 +36,7 @@ env:
 jobs:
   image:
     name: build and push
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, sid-cluster]
     permissions:
       contents: read
       packages: write
@@ -70,6 +70,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: false # post-step cache save hangs on the pool runners
 
       # The filter being present is not enough: prove it still does its job.
       - name: Regression test — a foreign driver's VolumeAttachment survives
@@ -88,8 +89,19 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Buildx
+      # @why: no Docker daemon on the cluster pool, so buildx uses the `remote`
+      # driver against the shared rootful BuildKit in arc-builders (mTLS client
+      # cert mounted at /certs/buildkit). Same snippet as the chart repo's ci.yml.
+      - name: Set up Buildx (remote BuildKit over mTLS)
         uses: docker/setup-buildx-action@v3
+        with:
+          driver: remote
+          endpoint: tcp://buildkitd.arc-builders.svc.cluster.local:1234
+          platforms: linux/amd64
+          driver-opts: |
+            cacert=/certs/buildkit/ca.crt
+            cert=/certs/buildkit/tls.crt
+            key=/certs/buildkit/tls.key
 
       - name: Build and push
         uses: docker/build-push-action@v6
