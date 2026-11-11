@@ -55,6 +55,65 @@ func TestControllerLeaderInterceptorRejectsFollowerControllerRPCs(t *testing.T) 
 	}
 }
 
+func TestControllerLeaderInterceptorAllowsCapabilitiesOnFollower(t *testing.T) {
+	leadership := &ControllerLeadership{
+		enabled:        true,
+		leaseName:      "lease-a",
+		leaseNamespace: "kube-system",
+	}
+	interceptor := controllerLeaderInterceptor(leadership)
+
+	called := false
+	_, err := interceptor(context.Background(), "req", &grpc.UnaryServerInfo{
+		FullMethod: "/csi.v1.Controller/ControllerGetCapabilities",
+	}, func(ctx context.Context, req any) (any, error) {
+		called = true
+		return "ok", nil
+	})
+
+	if err != nil {
+		t.Fatalf("expected capabilities to be served by a follower, got %v", err)
+	}
+	if !called {
+		t.Fatal("expected ControllerGetCapabilities to reach handler while not leader")
+	}
+}
+
+func TestControllerLeaderInterceptorRejectsMutatingRPCsOnFollower(t *testing.T) {
+	leadership := &ControllerLeadership{
+		enabled:        true,
+		leaseName:      "lease-a",
+		leaseNamespace: "kube-system",
+	}
+	interceptor := controllerLeaderInterceptor(leadership)
+
+	for _, method := range []string{
+		"/csi.v1.Controller/CreateVolume",
+		"/csi.v1.Controller/DeleteVolume",
+		"/csi.v1.Controller/ControllerPublishVolume",
+		"/csi.v1.Controller/ControllerUnpublishVolume",
+		"/csi.v1.Controller/ControllerExpandVolume",
+		"/csi.v1.Controller/CreateSnapshot",
+		"/csi.v1.Controller/DeleteSnapshot",
+	} {
+		t.Run(method, func(t *testing.T) {
+			called := false
+			_, err := interceptor(context.Background(), "req", &grpc.UnaryServerInfo{
+				FullMethod: method,
+			}, func(ctx context.Context, req any) (any, error) {
+				called = true
+				return "ok", nil
+			})
+			if status.Code(err) != codes.Unavailable {
+				t.Fatalf("expected Unavailable for %s, got %v", method, err)
+			}
+			if called {
+				t.Fatalf("expected %s to be rejected before handler", method)
+			}
+		})
+	}
+}
+
 func TestControllerLeaderInterceptorAllowsLeaderControllerRPCs(t *testing.T) {
 	leadership := &ControllerLeadership{enabled: true}
 	leadership.isLeader.Store(true)

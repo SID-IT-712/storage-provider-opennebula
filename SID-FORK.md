@@ -1,6 +1,6 @@
 # SID-IT-712 fork of OpenNebula/storage-provider-opennebula
 
-This fork exists to run **six fixes** that are not yet upstream, and to propose
+This fork exists to run **eight fixes** that are not yet upstream, and to propose
 them upstream from the exact commits we run.
 
 ## Fix 1: reconciler driver filter
@@ -225,6 +225,58 @@ live: a hard power-off from UNKNOWN, and a detach from POWEROFF, both need
 OpenNebula to reach the VM's host, so recovery from a host that is still
 unreachable may time out and refuse. It fails closed either way.
 
+## Fix 7: followers answer ControllerGetCapabilities
+
+**What was wrong.** With controller leader election on,
+`controllerLeaderInterceptor` (`pkg/csi/driver/grpcserver.go`) answered every
+`/csi.v1.Controller/*` call with `Unavailable` while the replica was not the
+leader, `ControllerGetCapabilities` included. The external-attacher,
+-provisioner, -resizer and -snapshotter sidecars call it once at startup and
+exit when it fails. A sidecar that restarted during a short leader-election gap
+(an API server or etcd blip, when no replica holds the lease) died on that
+check and crash-looped, while the driver container itself never restarted.
+
+**What changed.** `ControllerGetCapabilities` is exempt from the leader check
+(`leaderExemptControllerMethods`). It returns a static list and reads no cluster
+or OpenNebula state, so any replica may answer it. Every other Controller call,
+including all mutating ones, stays gated. Identity calls were never gated.
+Tests: `controller_leadership_test.go`
+(`TestControllerLeaderInterceptorAllowsCapabilitiesOnFollower`,
+`TestControllerLeaderInterceptorRejectsMutatingRPCsOnFollower`).
+**Chart:** no change.
+**Upstreamable:** yes, one code-only `fix(controller):` commit.
+
+## Fix 8: a VM busy hot-plugging another disk is not a node failure
+
+**What was wrong.** After a hotplug timeout, `handleHotplugTimeout`
+(`pkg/csi/driver/controllerserver.go`) asks the node health check whether the
+OpenNebula VM is RUNNING. A VM in HOTPLUG is not, so when the timeout happened
+only because OpenNebula was still attaching a *different* disk to the same VM
+(several volumes attaching at once), the driver recorded an unhealthy hotplug
+failure against a healthy node (`openNebulaReady=false`) and moved it toward
+cooldown and pause.
+
+**What changed.** The hotplug diagnosis (the same one that feeds the
+`opennebula-csi-hotplug-diagnostics` ConfigMap) is now consulted first. When it
+classifies the VM as HOTPLUG and still `Progressing`, with a disk flagged
+`ATTACH=YES` that is not this volume, the timeout is not counted against the
+node: it is logged, counted as
+`opennebula_csi_hotplug_guard_total{reason="vm_busy_other_hotplug",outcome="skipped"}`,
+and the operation is left for the caller's retry. A VM classified `Stuck`
+(HOTPLUG with no disk-state progress past the stuck threshold), a hotplug of
+this volume's own disk, and a VM with no in-flight disk all keep the old
+behaviour. With hotplug diagnostics disabled nothing changes.
+Tests: `hotplug_busy_test.go`.
+**Chart:** no change.
+**Upstreamable:** yes, one code-only `fix(controller):` commit.
+
+**Not changed: the attach timeout of a 100 GiB disk.** Its static budget is
+`BASE + ceil(size / 100 GiB) * PER_100GI`. With base 120 s and 60 s per 100 GiB
+a disk of exactly 100 GiB gets 180 s. That is the documented rounding (one
+block per started 100 GiB), not an off-by-one, so a longer budget is a values
+change (`driver.vmHotplugTimeoutBaseSeconds` /
+`driver.vmHotplugTimeoutPer100GiSeconds`), not a code fix.
+
 ## Branches
 
 | Branch | What it is | Rule |
@@ -236,6 +288,7 @@ unreachable may time out and refuse. It fails closed either way.
 | `fix/clone-requested-size` | fix 4's PR branch (base `sid/release`) | One code-only `fix(controller):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
 | `fix/stage-resize-fs` | fix 5's PR branch (base `sid/release`) | One code-only `fix(node):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
 | `fix/dead-owner-reattach` | fix 6's PR branch (base `sid/release`) | One code-only `fix(controller):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
+| `fix/…-leader-gate-capabilities` | fixes 7 and 8's PR branch (base `sid/release`) | Two code-only `fix(controller):` commits plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
 | `sid/release` | every fix **plus** this file and our workflows | Our deploy line. Images are built from here. Never merge it into a fix branch. |
 
 ## Images

@@ -1765,13 +1765,28 @@ func (s *ControllerServer) handleHotplugTimeout(ctx context.Context, node, volum
 
 	s.driver.metrics.RecordHotplugTimeout(operation, backend, "timeout_exhausted")
 	s.driver.metrics.RecordHotplugRecovery(operation, "timeout_exhausted", "observed")
-	if diagnosis, ok := s.diagnoseAndPersistHotplug(ctx, node); ok {
+	diagnosis, diagnosed := s.diagnoseAndPersistHotplug(ctx, node)
+	if diagnosed {
 		s.driver.metrics.RecordHotplugRecovery(operation, strings.ToLower(diagnosis.Classification), "observed")
 		if diagnosis.Classification == opennebula.HotplugClassificationStuck {
 			s.recordPVCWarningFromParams(ctx, params, eventReasonHotplugCooldown, diagnosis.Message)
 		}
 	}
 	if !s.nodeHotplugGuardEnabled() {
+		return
+	}
+	if diagnosed && hotplugBusyWithOtherDisk(diagnosis, volume) {
+		// The VM is not RUNNING only because OpenNebula is still hot-plugging a
+		// different disk. That is a busy node, not an unhealthy one: the
+		// operation is retried by the caller, and counting it would put a
+		// healthy node into cooldown whenever several volumes attach at once.
+		klog.V(1).InfoS("Hotplug timed out while the VM was busy hot-plugging another disk; not counting it as a node failure",
+			"node", node,
+			"volume", volume,
+			"operation", operation,
+			"busyVolume", diagnosis.VolumeHandle,
+			"busyFor", time.Duration(diagnosis.AgeSeconds)*time.Second)
+		s.driver.metrics.RecordHotplugGuard(operation, hotplugGuardReasonBusyOtherDisk, "skipped")
 		return
 	}
 
@@ -1815,6 +1830,25 @@ func (s *ControllerServer) handleHotplugTimeout(ctx context.Context, node, volum
 		message = s.formatHotplugGuardMessage(state)
 	}
 	s.recordPVCWarningFromParams(ctx, params, eventReasonHotplugCooldown, message)
+}
+
+// hotplugGuardReasonBusyOtherDisk labels hotplug timeouts that were not
+// counted against the node because the VM was busy with another disk.
+const hotplugGuardReasonBusyOtherDisk = "vm_busy_other_hotplug"
+
+// hotplugBusyWithOtherDisk reports whether a diagnosis shows the VM in HOTPLUG,
+// still making progress, for a disk other than volume. Only a disk that
+// OpenNebula has flagged as in flight (ATTACH=YES) counts; a VM that has stayed
+// in HOTPLUG past the stuck threshold is a real node problem and still counts.
+func hotplugBusyWithOtherDisk(diagnosis opennebula.HotplugDiagnosis, volume string) bool {
+	if diagnosis.Classification != opennebula.HotplugClassificationProgressing {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(diagnosis.DiskAttachFlag), "YES") {
+		return false
+	}
+	busy := strings.TrimSpace(diagnosis.VolumeHandle)
+	return busy != "" && busy != strings.TrimSpace(volume)
 }
 
 func (s *ControllerServer) persistHotplugStateSnapshot(ctx context.Context, state opennebula.HotplugCooldownState) {
