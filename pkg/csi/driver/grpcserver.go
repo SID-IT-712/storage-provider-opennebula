@@ -139,9 +139,23 @@ func (s *GRPCServer) run(endpoint string, identityServer *IdentityServer, nodeSe
 	}
 }
 
+// leaderExemptControllerMethods are Controller RPCs answered from static
+// driver configuration. They change nothing and read no cluster state, so any
+// replica may serve them. The CSI sidecars (external-attacher, -provisioner,
+// -resizer, -snapshotter) call ControllerGetCapabilities once at startup and
+// exit if it fails; gating it on leadership turns a short leader-election gap
+// (for example an API server or etcd blip) into a sidecar crash loop on every
+// follower replica.
+var leaderExemptControllerMethods = map[string]struct{}{
+	"/csi.v1.Controller/ControllerGetCapabilities": {},
+}
+
 func controllerLeaderInterceptor(leadership *ControllerLeadership) grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if leadership == nil || !leadership.Enabled() || !strings.HasPrefix(info.FullMethod, "/csi.v1.Controller/") {
+			return handler(ctx, req)
+		}
+		if _, exempt := leaderExemptControllerMethods[info.FullMethod]; exempt {
 			return handler(ctx, req)
 		}
 		if leadership.IsLeader() {
