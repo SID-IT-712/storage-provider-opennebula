@@ -1,6 +1,6 @@
 # SID-IT-712 fork of OpenNebula/storage-provider-opennebula
 
-This fork exists to run **eight fixes** that are not yet upstream, and to propose
+This fork exists to run **nine fixes** that are not yet upstream, and to propose
 them upstream from the exact commits we run.
 
 ## Fix 1: reconciler driver filter
@@ -277,6 +277,105 @@ block per started 100 GiB), not an off-by-one, so a longer budget is a values
 change (`driver.vmHotplugTimeoutBaseSeconds` /
 `driver.vmHotplugTimeoutPer100GiSeconds`), not a code fix.
 
+## Fix 9: never stage without serial proof; never publish without a serial
+
+**Invariant.** A stage never picks a device without serial proof, and a publish
+never omits the serial.
+
+**What was wrong.** `publishContextForVolume` (`pkg/csi/driver/controllerserver.go`)
+set `deviceSerial=onecsi-<imageID>` only if a second `VolumeExists()` call
+succeeded, and silently left it out otherwise (an OpenNebula API timeout, a
+cancelled queue context, or invalid CSI size metadata on the image). Without a
+serial, the node resolver returned the first existing `/dev/{sd,vd,xvd}<TARGET
+suffix>` with no identity check (`resolvedBy="exact"`). TARGET is not the guest's
+kernel name (fix 2), so on a node with hot-plug churn that device can be another
+volume's disk, already mounted. `checkMountPoint` only asked whether *this*
+staging path was mounted from *this* device, and mount-utils logs and ignores
+fsck's "is mounted", so NodeStage mounted the other volume's filesystem a second
+time and the new pod wrote into it. No mkfs ran (blkid saw a filesystem), but
+the pod's fsGroup re-owned the other volume's root.
+
+**What changed.**
+- **Controller.** `publishContextForVolume` takes the image id that
+  `ControllerPublishVolume` already resolved and no longer calls `VolumeExists`
+  a second time, so the lookup whose failure dropped the serial is gone. It
+  never returns a context without `deviceSerial`: an invalid image id is an
+  `Unavailable` error, logged with the volume id at error level. Image 0 now gets
+  `onecsi-0` (its disk has that serial; the old `> 0` check dropped it). Every
+  caller propagates the error: the already-attached path, the attach path, and
+  same-node sticky reuse (which builds the context before clearing its sticky
+  state). A failure after a successful attach leaves the disk attached in
+  OpenNebula; the attacher's retry finds it with `GetVolumeInNode` and only builds
+  the context, so it is idempotent and never attaches twice.
+- **Node resolver.** A publish context without `deviceSerial` is refused with
+  `FailedPrecondition` ("publish context has no deviceSerial; refusing to resolve
+  by target name") from every path: `NodeDeviceResolver.Resolve`,
+  `resolveDevicePathWithContext` with or without a resolver, block publish and
+  local RWO recovery. `requireSerialProof` refuses a missing serial instead of
+  passing it. The target-name alias resolution and the device cache it fed are
+  removed: a serial request never used the cache, and nothing else is left to
+  use it. `ONE_CSI_NODE_DEVICE_CACHE_ENABLED` / `_TTL_SECONDS` and the chart's
+  `driver.nodeDeviceCache.enabled` / `ttlSeconds` are removed, and so is the
+  `opennebula_csi_device_cache_total` metric; the `DeviceCacheMiss` PVC event is
+  now `DeviceSerialResolved`. With a serial, resolution is unchanged: kernel
+  serial, then exact by-id.
+- **NodeStage.** Before formatting or mounting, `refuseDeviceMountedElsewhere`
+  reads the mount table through the mounter and attributes every other mount of
+  the device: a kubelet pod target names its PV in the path
+  (`.../pods/<uid>/volumes/kubernetes.io~csi/<pv>/mount`), and a staging dir has
+  kubelet's `vol_data.json` beside its `globalmount` naming the volume handle.
+  This volume's own mounts (PV equal to the context's
+  `csi.storage.k8s.io/pv/name` or to the volume id, or a matching handle) are
+  allowed. Another volume's, and any mount that cannot be attributed, are refused
+  (`FailedPrecondition`, naming both paths). The idempotent case (already staged
+  at this path, even with pod bind mounts) still succeeds before the check, and
+  `checkMountPoint` now compares paths after `Clean` and symlink resolution and
+  devices as block devices, so a differently spelled staging path is still
+  recognised. After `FormatAndMount` the check
+  runs again; a device found mounted elsewhere unmounts the new stage and fails.
+  A format/mount error saying the device is mounted is a `FailedPrecondition`
+  refusal. Local RWO recovery runs the same check before its remount.
+
+**Compatibility (intended, fail closed).** A VolumeAttachment written by an
+older controller without `deviceSerial` in `.status.attachmentMetadata` now fails
+NodeStage (for example after a node or kubelet restart) instead of guessing.
+Find them with:
+
+```bash
+kubectl get volumeattachments -o json | jq -r '.items[]
+  | select(.spec.attacher == "csi.opennebula.io")
+  | select((.status.attachmentMetadata.deviceSerial // "") == "")
+  | .metadata.name + " " + .spec.source.persistentVolumeName + " " + .spec.nodeName'
+```
+
+Re-attaching the volume (scale its workload down so the VolumeAttachment is
+deleted, then up) makes the controller publish a context with the serial. There
+is no opt-out flag.
+
+Tests: `TestPublishContextForVolumeFailsWithoutSerial`,
+`TestPublishContextForVolumeSerialForImageZero`,
+`TestControllerPublishVolumeSerialNeedsNoSecondImageLookup`,
+`TestControllerPublishVolumeAlreadyAttachedIsIdempotent`,
+`TestControllerPublishVolumeStickyReusePublishesSerial`
+(`controllerserver_test.go`); `TestNodeDeviceResolverRefusesContextWithoutSerial`,
+`TestNodeDeviceResolverIncidentResolvesBySerialNotTarget`,
+`TestNodeDeviceResolverProvesSerialOnEveryCall` (`node_device_resolver_test.go`);
+`TestResolveDevicePath`, `TestStageVolume`,
+`TestStageVolumeRefusesDeviceMountedElsewhereAfterMount`,
+`TestStageVolumeTreatsDeviceIsMountedAsFatal`,
+`TestRefuseDeviceMountedElsewhereMatchesStagingPathSpellings`,
+`TestStageVolumeIdempotentWithSymlinkedStagingAndPodBind`,
+`TestStageVolumeAttributesMountsOfTheDevice`,
+`TestMountErrorSaysDeviceMounted` (`nodeserver_test.go`);
+`TestResolveWithoutSerialRefusesAlias`, `TestRequireSerialProof`
+(`node_kernel_serial_test.go`); `TestLocalDiskRecoveryRefusesUnprovenOrBusyDevice`
+(`nodeserver_stage_grow_test.go`).
+**Chart:** the dead `nodeDeviceCache.enabled` / `ttlSeconds` values and their
+env vars are removed.
+**Upstreamable:** yes, as code-only `fix(csi):` commits. Upstream's master has
+the same silent drop and also resolves by alias when a serial is present, so an
+upstream PR needs fix 2 first.
+
 ## Branches
 
 | Branch | What it is | Rule |
@@ -289,6 +388,7 @@ change (`driver.vmHotplugTimeoutBaseSeconds` /
 | `fix/stage-resize-fs` | fix 5's PR branch (base `sid/release`) | One code-only `fix(node):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
 | `fix/dead-owner-reattach` | fix 6's PR branch (base `sid/release`) | One code-only `fix(controller):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
 | `fix/…-leader-gate-capabilities` | fixes 7 and 8's PR branch (base `sid/release`) | Two code-only `fix(controller):` commits plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
+| `fix/op-1319-serial-proof` | fix 9's PR branch (base `sid/release`) | Code-only `fix(csi):` commits plus `docs(sid):` commits for this file. Merge with a rebase or a merge commit, never a squash. |
 | `sid/release` | every fix **plus** this file and our workflows | Our deploy line. Images are built from here. Never merge it into a fix branch. |
 
 ## Images
@@ -315,7 +415,9 @@ change (`driver.vmHotplugTimeoutBaseSeconds` /
    `fix(controller): defer detached disk expansion to the next attach`, and fix 4's
    `fix(controller): size clones from the effective source size`, and fix 5's
    `fix(node): grow an existing filesystem to its device on stage`, and fix 6's
-   `fix(controller): re-attach an RWO volume from a dead owner VM`. Before tagging, check that
+   `fix(controller): re-attach an RWO volume from a dead owner VM`, and fixes 7 and 8's
+   `fix(controller):` commits, and fix 9's `fix(csi): never stage a device without serial
+   proof; never publish without a serial`. Before tagging, check that
    `git log --oneline <new-tag>..sid/release` still lists all three fix-2 commits. If one
    is dropped, the re-stage failure and the alias path come back silently.
 3. For an upstream PR of fix 2, cherry-pick all three commits, in order, onto the
@@ -326,6 +428,7 @@ change (`driver.vmHotplugTimeoutBaseSeconds` /
    Then fix 4's: `go test ./pkg/csi/opennebula/ -count=1 -run '^TestClone'`.
    Then fix 5's: `go test ./pkg/csi/driver/ -count=1 -run '^(TestStageVolumeGrows|TestStageVolumeLeaves|TestStageVolumeFailsWhenGrow|TestStageVolumeRestageGrows|TestStageVolumeBlockNeverGrows|TestStageVolumeReadOnlyNeverGrows|TestLocalDiskRecovery)'`.
    Then fix 6's: `go test ./pkg/csi/... -count=1 -run '^(TestDeadOwner|TestStickyOldNodeGone|TestNodeHasTaint|TestInspectVolumeAttachmentRecordsOwnerVMStates|TestPoweroffVMHard|TestDetachVolumeFromStoppedVM)'`.
+   Then fix 9's: `go test ./pkg/csi/driver/ -count=1 -run '^(TestPublishContextForVolume|TestControllerPublishVolume|TestNodeDeviceResolver|TestResolveDevicePath|TestResolveWithoutSerial|TestRequireSerialProof|TestStageVolume|TestRefuseDeviceMountedElsewhere|TestMountErrorSays|TestLocalDiskRecovery)'`.
    Then tag `sid-v<new-upstream>-1`.
 5. If upstream has merged an equivalent fix, retire this fork: pin upstream's image
    in our deployment tooling, and trust its repository to run the reconciler only

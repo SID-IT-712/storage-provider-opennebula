@@ -34,7 +34,6 @@ type DriverMetrics struct {
 	nodeStageDuration            *prometheus.HistogramVec
 	nodeDeviceResolutionDuration *prometheus.HistogramVec
 	nodeDeviceResolutionTotal    *prometheus.CounterVec
-	deviceCacheTotal             *prometheus.CounterVec
 	hotplugRecoveryTotal         *prometheus.CounterVec
 	stickyDetachTotal            *prometheus.CounterVec
 	stickyDetachResidency        *prometheus.HistogramVec
@@ -130,10 +129,6 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 			Name: "opennebula_csi_node_device_resolution_total",
 			Help: "Total number of node device resolution attempts partitioned by method and outcome.",
 		}, []string{"method", "outcome"}),
-		deviceCacheTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "opennebula_csi_device_cache_total",
-			Help: "Total number of node device cache operations by operation and outcome.",
-		}, []string{"operation", "outcome"}),
 		hotplugRecoveryTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "opennebula_csi_hotplug_recovery_total",
 			Help: "Total number of hotplug recovery path decisions by operation, reason, and outcome.",
@@ -249,7 +244,6 @@ func NewDriverMetrics(version, commit string) *DriverMetrics {
 		metrics.nodeStageDuration,
 		metrics.nodeDeviceResolutionDuration,
 		metrics.nodeDeviceResolutionTotal,
-		metrics.deviceCacheTotal,
 		metrics.hotplugRecoveryTotal,
 		metrics.stickyDetachTotal,
 		metrics.stickyDetachResidency,
@@ -371,13 +365,6 @@ func (m *DriverMetrics) RecordNodeDeviceResolution(method, outcome string) {
 		return
 	}
 	m.nodeDeviceResolutionTotal.WithLabelValues(method, outcome).Inc()
-}
-
-func (m *DriverMetrics) RecordDeviceCache(operation, outcome string) {
-	if m == nil {
-		return
-	}
-	m.deviceCacheTotal.WithLabelValues(operation, outcome).Inc()
 }
 
 func (m *DriverMetrics) RecordHotplugRecovery(operation, reason, outcome string) {

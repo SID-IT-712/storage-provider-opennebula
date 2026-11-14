@@ -104,8 +104,6 @@ Create chart name and version as used by the chart label.
 {{- $lastNodePreferenceWebhook := (get $lastNodePreference "webhook") | default dict -}}
 {{- $stuckAttachmentReconciler := (get $root.Values.driver "stuckAttachmentReconciler") | default dict -}}
 {{- $adaptiveTimeout := (get $root.Values.driver "adaptiveTimeout") | default dict -}}
-{{- $nodeDeviceCacheEnabled := (get $nodeDeviceCache "enabled") | default true -}}
-{{- $nodeDeviceCacheTTLSeconds := (get $nodeDeviceCache "ttlSeconds") | default 600 -}}
 {{- $nodeDeviceUdevSettleTimeoutSeconds := (get $nodeDeviceCache "udevSettleTimeoutSeconds") | default 10 -}}
 {{- $nodeDeviceRescanOnMissEnabled := (get $nodeDeviceCache "rescanOnMissEnabled") | default true -}}
 {{- $nodeExpandVerifyTimeoutSeconds := (get $nodeExpand "verifyTimeoutSeconds") | default 120 -}}
@@ -217,10 +215,6 @@ Create chart name and version as used by the chart label.
   value: {{ $nodeExpandRetryIntervalSeconds | quote }}
 - name: ONE_CSI_NODE_EXPAND_SIZE_TOLERANCE_BYTES
   value: {{ $nodeExpandSizeToleranceBytes | int | quote }}
-- name: ONE_CSI_NODE_DEVICE_CACHE_ENABLED
-  value: {{ $nodeDeviceCacheEnabled | quote }}
-- name: ONE_CSI_NODE_DEVICE_CACHE_TTL_SECONDS
-  value: {{ $nodeDeviceCacheTTLSeconds | quote }}
 - name: ONE_CSI_NODE_DEVICE_UDEV_SETTLE_TIMEOUT_SECONDS
   value: {{ $nodeDeviceUdevSettleTimeoutSeconds | quote }}
 - name: ONE_CSI_NODE_DEVICE_RESCAN_ON_MISS_ENABLED

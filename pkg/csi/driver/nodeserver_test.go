@@ -12,6 +12,7 @@ import (
 	"github.com/OpenNebula/storage-provider-opennebula/pkg/csi/config"
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -117,59 +118,306 @@ func withTestDiskPath(t *testing.T) string {
 	return diskPath
 }
 
+// incidentDisks lays out the incident: OpenNebula TARGET sdad, but the guest's
+// /dev/sdad is another volume's disk (serial onecsi-2690) and this volume's
+// disk (serial onecsi-2936) is /dev/sdac.
+func incidentDisks(t *testing.T) (diskPath, own, other string) {
+	t.Helper()
+	sysfs := withTestSysfs(t)
+	diskPath = withTestDiskPath(t)
+	steppingResolverClock(t)
+	other = writeDisk(t, diskPath, "sdad")
+	own = writeDisk(t, diskPath, "sdac")
+	writeSysfsVPD80(t, sysfs, "sdad", vpdPage80("onecsi-2690"))
+	writeSysfsVPD80(t, sysfs, "sdac", vpdPage80("onecsi-2936"))
+	return diskPath, own, other
+}
+
+func incidentStageRequest(staging string, withSerial bool) *csi.NodeStageVolumeRequest {
+	publishContext := map[string]string{
+		"volumeName": "sdad",
+		publishContextDeviceDiscoveryTimeoutSeconds: "1",
+	}
+	if withSerial {
+		publishContext[publishContextDeviceSerial] = "onecsi-2936"
+		publishContext[publishContextOpenNebulaImageID] = "2936"
+	}
+	return &csi.NodeStageVolumeRequest{
+		VolumeId:          "vol-2936",
+		StagingTargetPath: staging,
+		VolumeCapability: &csi.VolumeCapability{
+			AccessType: &csi.VolumeCapability_Mount{Mount: &csi.VolumeCapability_MountVolume{FsType: "ext4"}},
+			AccessMode: &csi.VolumeCapability_AccessMode{Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER},
+		},
+		PublishContext: publishContext,
+	}
+}
+
+func mountedAt(fm *mount.FakeMounter, device string) []string {
+	paths := []string{}
+	for _, mp := range fm.MountPoints {
+		if mp.Device == device {
+			paths = append(paths, mp.Path)
+		}
+	}
+	return paths
+}
+
 func TestStageVolume(t *testing.T) {
-	tempDir := t.TempDir()
-	diskPath := withTestDiskPath(t)
-	stubStageGrow(t, false, nil, nil)
-	err := os.WriteFile(filepath.Join(diskPath, "zero"), []byte("test"), 0o644)
-	assert.NoError(t, err)
+	const otherStaging = "/var/lib/kubelet/plugins/kubernetes.io/csi/csi.opennebula.io/other/globalmount"
+	const podBind = "/var/lib/kubelet/pods/pod-a/volumes/kubernetes.io~csi/vol-2936/mount"
 
 	tcs := []struct {
-		name           string
-		request        *csi.NodeStageVolumeRequest
-		expectResponse *csi.NodeStageVolumeResponse
-		expectError    bool
+		name        string
+		withSerial  bool
+		mounts      func(own, other, staging string) []mount.MountPoint
+		expectCode  codes.Code
+		expectInErr []string
+		// expectNamesStaging: the error names this volume's staging path too.
+		expectNamesStaging bool
+		// expectOwnMountedAt: where the volume's own disk is mounted afterwards.
+		expectOwnMountedAt func(staging string) []string
 	}{
 		{
-			name: "[SUCCESS] Test basic volume mount",
-			request: &csi.NodeStageVolumeRequest{
-				VolumeId:          "test-volume-id",
-				StagingTargetPath: tempDir,
-				VolumeCapability: &csi.VolumeCapability{
-					AccessType: &csi.VolumeCapability_Mount{
-						Mount: &csi.VolumeCapability_MountVolume{
-							FsType: "ext4",
-						},
-					},
-					AccessMode: &csi.VolumeCapability_AccessMode{
-						Mode: csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
-					},
-				},
-				PublishContext: map[string]string{
-					"volumeName": "zero",
-				},
+			name:       "serial proves the device: TARGET sdad is ignored, sdac is staged",
+			withSerial: true,
+			mounts: func(_, other, _ string) []mount.MountPoint {
+				return []mount.MountPoint{{Device: other, Path: otherStaging, Type: "ext4"}}
 			},
-			expectResponse: &csi.NodeStageVolumeResponse{},
-			expectError:    false,
+			expectCode:         codes.OK,
+			expectOwnMountedAt: func(staging string) []string { return []string{staging} },
+		},
+		{
+			name:       "incident: no serial and /dev/<TARGET> is another, mounted disk",
+			withSerial: false,
+			mounts: func(_, other, _ string) []mount.MountPoint {
+				return []mount.MountPoint{{Device: other, Path: otherStaging, Type: "ext4"}}
+			},
+			expectCode:         codes.FailedPrecondition,
+			expectInErr:        []string{"publish context has no deviceSerial; refusing to resolve by target name"},
+			expectOwnMountedAt: func(string) []string { return []string{} },
+		},
+		{
+			name:       "the proven device is already mounted for another volume",
+			withSerial: true,
+			mounts: func(own, _, _ string) []mount.MountPoint {
+				return []mount.MountPoint{{Device: own, Path: otherStaging, Type: "ext4"}}
+			},
+			expectCode:         codes.FailedPrecondition,
+			expectInErr:        []string{"already mounted at " + otherStaging, "refusing to stage it at"},
+			expectNamesStaging: true,
+			expectOwnMountedAt: func(string) []string { return []string{otherStaging} },
+		},
+		{
+			name:       "idempotent: already staged at this path (and bind-published to a pod)",
+			withSerial: true,
+			mounts: func(own, _, staging string) []mount.MountPoint {
+				return []mount.MountPoint{
+					{Device: own, Path: staging, Type: "ext4"},
+					{Device: own, Path: podBind, Type: "ext4"},
+				}
+			},
+			expectCode:         codes.OK,
+			expectOwnMountedAt: func(staging string) []string { return []string{staging, podBind} },
 		},
 	}
 
 	for _, tc := range tcs {
 		t.Run(tc.name, func(t *testing.T) {
-			ns := getTestNodeServer([]string{})
-			response, err := ns.NodeStageVolume(context.Background(), tc.request)
-			if tc.expectError {
-				assert.Error(t, err)
+			_, own, other := incidentDisks(t)
+			stubStageGrow(t, false, nil, nil)
+			staging := t.TempDir()
+			ns := getTestNodeServerWithMountPoints(tc.mounts(own, other, staging))
+			fm := ns.mounter.Interface.(*mount.FakeMounter)
+			otherBefore := mountedAt(fm, other)
+
+			response, err := ns.NodeStageVolume(context.Background(), incidentStageRequest(staging, tc.withSerial))
+
+			assert.Equal(t, tc.expectCode, status.Code(err), "err: %v", err)
+			if tc.expectCode == codes.OK {
+				assert.Equal(t, &csi.NodeStageVolumeResponse{}, response)
 			} else {
-				assert.NoError(t, err)
+				assert.Nil(t, response)
 			}
-			if tc.expectResponse != nil {
-				assert.Equal(t, tc.expectResponse, response)
-			} else {
-				assert.NotNil(t, response)
+			if tc.expectNamesStaging {
+				assert.Contains(t, err.Error(), staging)
 			}
+			for _, fragment := range tc.expectInErr {
+				assert.Contains(t, err.Error(), fragment)
+			}
+			assert.ElementsMatch(t, tc.expectOwnMountedAt(staging), mountedAt(fm, own))
+			assert.Equal(t, otherBefore, mountedAt(fm, other), "the other volume's disk is never mounted again")
 		})
 	}
+}
+
+// The mount table may spell this volume's own staging path differently (a
+// symlinked kubelet dir, a trailing slash). That is still this stage, not
+// "elsewhere", so a fresh stage is kept and an existing one is idempotent.
+func TestRefuseDeviceMountedElsewhereMatchesStagingPathSpellings(t *testing.T) {
+	_, own, _ := incidentDisks(t)
+	realStaging := t.TempDir()
+	linkDir := filepath.Join(t.TempDir(), "kubelet")
+	assert.NoError(t, os.Symlink(realStaging, linkDir))
+
+	for name, mountedPath := range map[string]string{
+		"trailing slash": realStaging + "/",
+		"resolved path":  realStaging,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Device: own, Path: mountedPath, Type: "ext4"}})
+			assert.NoError(t, ns.refuseDeviceMountedElsewhere(own, linkDir, "vol-2936", ""))
+		})
+	}
+	ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Device: own, Path: "/other/globalmount", Type: "ext4"}})
+	assert.Equal(t, codes.FailedPrecondition, status.Code(ns.refuseDeviceMountedElsewhere(own, linkDir, "vol-2936", "")))
+}
+
+func TestMountErrorSaysDeviceMounted(t *testing.T) {
+	assert.True(t, mountErrorSaysDeviceMounted(errors.New("mount: /stage: /dev/sdac already mounted or mount point busy"), "/dev/sdac"))
+	assert.True(t, mountErrorSaysDeviceMounted(errors.New("fsck: /dev/sdac is mounted."), "/dev/sdac"))
+	assert.False(t, mountErrorSaysDeviceMounted(errors.New("mount: /stage: filesystem is mounted read-only"), "/dev/sdac"))
+	assert.False(t, mountErrorSaysDeviceMounted(errors.New("can't read superblock"), "/dev/sdac"))
+	assert.False(t, mountErrorSaysDeviceMounted(nil, "/dev/sdac"))
+}
+
+// QA hole 1: kubelet passes a symlinked spelling of a staging path that is
+// already staged, while a pod bind mount of this volume exists. That is the
+// idempotent re-stage, not a refusal.
+func TestStageVolumeIdempotentWithSymlinkedStagingAndPodBind(t *testing.T) {
+	_, own, _ := incidentDisks(t)
+	stubStageGrow(t, false, nil, nil)
+	realStaging := t.TempDir()
+	link := filepath.Join(t.TempDir(), "kubelet-link")
+	require.NoError(t, os.Symlink(realStaging, link))
+	podTarget := "/var/lib/kubelet/pods/uid1/volumes/kubernetes.io~csi/pv-a/mount"
+	ns := getTestNodeServerWithMountPoints([]mount.MountPoint{
+		{Device: own, Path: realStaging, Type: "ext4"},
+		{Device: own, Path: podTarget, Type: "ext4"},
+	})
+	fm := ns.mounter.Interface.(*mount.FakeMounter)
+
+	_, err := ns.NodeStageVolume(context.Background(), incidentStageRequest(link, true))
+
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{realStaging, podTarget}, mountedAt(fm, own), "nothing new is mounted")
+}
+
+// writeStagingDir lays out a kubelet staging dir: <dir>/globalmount plus the
+// vol_data.json kubelet writes beside it, naming the volume handle.
+func writeStagingDir(t *testing.T, volumeHandle string) string {
+	t.Helper()
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "globalmount"), 0o755))
+	if volumeHandle != "" {
+		data, err := json.Marshal(map[string]string{"volumeHandle": volumeHandle, "driverName": DefaultDriverName})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "vol_data.json"), data, 0o644))
+	}
+	return filepath.Join(dir, "globalmount")
+}
+
+// QA hole 2 and its siblings: before refusing a device mounted elsewhere, each
+// mount is attributed to a volume. This volume's own mounts are allowed;
+// another volume's, and anything that cannot be attributed, are refused.
+func TestStageVolumeAttributesMountsOfTheDevice(t *testing.T) {
+	ownPodTarget := "/var/lib/kubelet/pods/uid1/volumes/kubernetes.io~csi/pv-a/mount"
+	handlePodTarget := "/var/lib/kubelet/pods/uid1/volumes/kubernetes.io~csi/vol-2936/mount"
+	otherPodTarget := "/var/lib/kubelet/pods/uid2/volumes/kubernetes.io~csi/pv-b/mount"
+
+	tcs := []struct {
+		name       string
+		mountPath  func(t *testing.T) string
+		expectCode codes.Code
+	}{
+		{"own pod bind mount (PV name from the publish context)", func(*testing.T) string { return ownPodTarget }, codes.OK},
+		{"own pod bind mount (PV named like the volume handle)", func(*testing.T) string { return handlePodTarget }, codes.OK},
+		{"own staging dir elsewhere (vol_data.json names this volume)", func(t *testing.T) string { return writeStagingDir(t, "vol-2936") }, codes.OK},
+		{"another volume's pod bind mount", func(*testing.T) string { return otherPodTarget }, codes.FailedPrecondition},
+		{"another volume's staging dir", func(t *testing.T) string { return writeStagingDir(t, "vol-2690") }, codes.FailedPrecondition},
+		{"staging dir without vol_data.json (unattributable)", func(t *testing.T) string { return writeStagingDir(t, "") }, codes.FailedPrecondition},
+		{"any other path (unattributable)", func(*testing.T) string { return "/mnt/manual" }, codes.FailedPrecondition},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			_, own, _ := incidentDisks(t)
+			stubStageGrow(t, false, nil, nil)
+			staging := t.TempDir()
+			elsewhere := tc.mountPath(t)
+			ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Device: own, Path: elsewhere, Type: "ext4"}})
+			fm := ns.mounter.Interface.(*mount.FakeMounter)
+			req := incidentStageRequest(staging, true)
+			req.PublishContext[paramPVName] = "pv-a"
+
+			_, err := ns.NodeStageVolume(context.Background(), req)
+
+			assert.Equal(t, tc.expectCode, status.Code(err), "err: %v", err)
+			if tc.expectCode == codes.OK {
+				assert.ElementsMatch(t, []string{elsewhere, staging}, mountedAt(fm, own))
+				return
+			}
+			assert.Contains(t, err.Error(), elsewhere)
+			assert.Contains(t, err.Error(), staging)
+			assert.Equal(t, []string{elsewhere}, mountedAt(fm, own), "nothing new is mounted")
+		})
+	}
+}
+
+// raceMounter mounts like the fake, then reports the device as also mounted
+// elsewhere: what a concurrent mount (or fsck's swallowed "is mounted") means.
+type raceMounter struct {
+	*mount.FakeMounter
+	alsoAt string
+}
+
+func (r *raceMounter) MountSensitive(source, target, fstype string, options []string, sensitive []string) error {
+	if err := r.FakeMounter.MountSensitive(source, target, fstype, options, sensitive); err != nil {
+		return err
+	}
+	r.MountPoints = append(r.MountPoints, mount.MountPoint{Device: source, Path: r.alsoAt, Type: fstype})
+	return nil
+}
+
+func (r *raceMounter) MountSensitiveWithoutSystemd(source, target, fstype string, options []string, sensitive []string) error {
+	return r.MountSensitive(source, target, fstype, options, sensitive)
+}
+
+func (r *raceMounter) MountSensitiveWithoutSystemdWithMountFlags(source, target, fstype string, options []string, sensitive []string, _ []string) error {
+	return r.MountSensitive(source, target, fstype, options, sensitive)
+}
+
+// A device found mounted elsewhere after the mount is fatal: the new stage is
+// unmounted again and NodeStage fails.
+func TestStageVolumeRefusesDeviceMountedElsewhereAfterMount(t *testing.T) {
+	_, own, _ := incidentDisks(t)
+	stubStageGrow(t, false, nil, nil)
+	staging := t.TempDir()
+	base := getTestNodeServer(nil)
+	fm := &raceMounter{FakeMounter: mount.NewFakeMounter(nil), alsoAt: "/elsewhere/globalmount"}
+	ns := NewNodeServer(base.Driver, &mount.SafeFormatAndMount{Interface: fm, Exec: base.mounter.Exec})
+
+	_, err := ns.NodeStageVolume(context.Background(), incidentStageRequest(staging, true))
+
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "/elsewhere/globalmount")
+	assert.NotContains(t, mountedAt(fm.FakeMounter, own), staging, "the new stage is unmounted again")
+}
+
+// FormatAndMount reporting the device as mounted is fatal and a refusal.
+func TestStageVolumeTreatsDeviceIsMountedAsFatal(t *testing.T) {
+	incidentDisks(t)
+	stubStageGrow(t, false, nil, nil)
+	staging := t.TempDir()
+	base := getTestNodeServer(nil)
+	fm := &failingMountInterface{FakeMounter: mount.NewFakeMounter(nil), err: errors.New("mount: " + filepath.Join(defaultDiskPath, "sdac") + " already mounted or mount point busy")}
+	ns := NewNodeServer(base.Driver, &mount.SafeFormatAndMount{Interface: fm, Exec: base.mounter.Exec})
+
+	_, err := ns.NodeStageVolume(context.Background(), incidentStageRequest(staging, true))
+
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+	assert.Contains(t, err.Error(), "already mounted")
 }
 
 func TestStageVolumeKeepsLocalDeviceReportUntilMountSucceeds(t *testing.T) {
@@ -285,43 +533,59 @@ func TestRecordLocalDiskStageSessionClearsPreviousRecoveryFailure(t *testing.T) 
 }
 
 func TestResolveDevicePath(t *testing.T) {
-	t.Run("returns exact device path when present", func(t *testing.T) {
-		diskPath := withTestDiskPath(t)
-		err := os.WriteFile(filepath.Join(diskPath, "sde"), []byte("test"), 0o644)
-		assert.NoError(t, err)
-
+	t.Run("refuses a context without deviceSerial although /dev/<TARGET> exists", func(t *testing.T) {
+		_, _, _ = incidentDisks(t)
 		ns := getTestNodeServer(nil)
-		devicePath, resolution, resolveErr := ns.resolveDevicePath("sde", time.Second)
 
-		assert.NoError(t, resolveErr)
-		assert.Equal(t, filepath.Join(diskPath, "sde"), devicePath)
-		assert.Equal(t, "exact", resolution.ResolvedBy)
+		devicePath, resolution, resolveErr := ns.resolveDevicePathWithContext(context.Background(), "vol-2936", "sdad", map[string]string{"volumeName": "sdad"}, time.Second)
+
+		assert.Empty(t, devicePath)
+		assert.Empty(t, resolution.ResolvedBy)
+		assert.ErrorIs(t, resolveErr, errNoDeviceSerial)
+		assert.Equal(t, codes.FailedPrecondition, deviceResolutionFailureCode(resolveErr))
 	})
 
-	t.Run("falls back to virtio alias when present", func(t *testing.T) {
-		diskPath := withTestDiskPath(t)
-		err := os.WriteFile(filepath.Join(diskPath, "vde"), []byte("test"), 0o644)
-		assert.NoError(t, err)
-
+	t.Run("refuses a context without deviceSerial when there is no resolver", func(t *testing.T) {
+		_, _, _ = incidentDisks(t)
 		ns := getTestNodeServer(nil)
-		devicePath, resolution, resolveErr := ns.resolveDevicePath("sde", time.Second)
+		ns.deviceResolver = nil
 
-		assert.NoError(t, resolveErr)
-		assert.Equal(t, filepath.Join(diskPath, "vde"), devicePath)
-		assert.Equal(t, "alias", resolution.ResolvedBy)
+		devicePath, _, resolveErr := ns.resolveDevicePathWithContext(context.Background(), "vol-2936", "sdad", map[string]string{"volumeName": "sdad"}, time.Second)
+
+		assert.Empty(t, devicePath)
+		assert.ErrorIs(t, resolveErr, errNoDeviceSerial)
+		assert.Contains(t, resolveErr.Error(), "publish context has no deviceSerial; refusing to resolve by target name")
+		assert.Equal(t, codes.FailedPrecondition, deviceResolutionFailureCode(resolveErr))
 	})
 
-	t.Run("times out when no candidate device appears", func(t *testing.T) {
+	t.Run("resolves by serial, not by target name", func(t *testing.T) {
+		_, own, _ := incidentDisks(t)
+		ns := getTestNodeServer(nil)
+
+		devicePath, resolution, resolveErr := ns.resolveDevicePathWithContext(context.Background(), "vol-2936", "sdad", map[string]string{
+			"volumeName":               "sdad",
+			publishContextDeviceSerial: "onecsi-2936",
+		}, time.Second)
+
+		require.NoError(t, resolveErr)
+		assert.Equal(t, own, devicePath)
+		assert.Equal(t, "kernel-serial", resolution.ResolvedBy)
+	})
+
+	t.Run("times out when no device carries the serial", func(t *testing.T) {
+		withTestSysfs(t)
 		withTestDiskPath(t)
+		steppingResolverClock(t)
 		ns := getTestNodeServer(nil)
 		ns.Driver.PluginConfig.OverrideVal(config.NodeDeviceDiscoveryTimeoutVar, 1)
 
-		devicePath, _, resolveErr := ns.resolveDevicePath("sdf", ns.deviceDiscoveryTimeout(nil))
+		devicePath, _, resolveErr := ns.resolveDevicePathWithContext(context.Background(), "vol-1", "sdf", map[string]string{publishContextDeviceSerial: "onecsi-5"}, ns.deviceDiscoveryTimeout(nil))
 
 		assert.Empty(t, devicePath)
-		assert.Error(t, resolveErr)
-		assert.Contains(t, resolveErr.Error(), "timed out after 1s")
-		assert.Contains(t, resolveErr.Error(), "sdf")
+		require.Error(t, resolveErr)
+		assert.Contains(t, resolveErr.Error(), "after 1s")
+		assert.Contains(t, resolveErr.Error(), "TARGET sdf is not used")
+		assert.Equal(t, codes.DeadlineExceeded, deviceResolutionFailureCode(resolveErr))
 	})
 
 	t.Run("uses dedicated publish context timeout override when present", func(t *testing.T) {

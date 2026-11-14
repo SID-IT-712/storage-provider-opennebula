@@ -42,8 +42,6 @@ const (
 	NodeExpandVerifyTimeoutSecondsVar          = "ONE_CSI_NODE_EXPAND_VERIFY_TIMEOUT_SECONDS"
 	NodeExpandRetryIntervalSecondsVar          = "ONE_CSI_NODE_EXPAND_RETRY_INTERVAL_SECONDS"
 	NodeExpandSizeToleranceBytesVar            = "ONE_CSI_NODE_EXPAND_SIZE_TOLERANCE_BYTES"
-	NodeDeviceCacheEnabledVar                  = "ONE_CSI_NODE_DEVICE_CACHE_ENABLED"
-	NodeDeviceCacheTTLSecondsVar               = "ONE_CSI_NODE_DEVICE_CACHE_TTL_SECONDS"
 	NodeDeviceUdevSettleTimeoutSecondsVar      = "ONE_CSI_NODE_DEVICE_UDEV_SETTLE_TIMEOUT_SECONDS"
 	NodeDeviceRescanOnMissEnabledVar           = "ONE_CSI_NODE_DEVICE_RESCAN_ON_MISS_ENABLED"
 	HotplugQueueEnabledVar                     = "ONE_CSI_HOTPLUG_QUEUE_ENABLED"
@@ -129,8 +127,6 @@ const (
 	defaultNodeExpandVerifyTimeoutSeconds          = 120
 	defaultNodeExpandRetryIntervalSeconds          = 2
 	defaultNodeExpandSizeToleranceBytes            = 134217728
-	defaultNodeDeviceCacheEnabled                  = true
-	defaultNodeDeviceCacheTTLSeconds               = 600
 	defaultNodeDeviceUdevSettleTimeoutSeconds      = 10
 	defaultNodeDeviceRescanOnMissEnabled           = true
 	defaultHotplugQueueEnabled                     = true
@@ -244,8 +240,6 @@ func initViper() *viper.Viper {
 	viper.SetDefault(NodeExpandVerifyTimeoutSecondsVar, defaultNodeExpandVerifyTimeoutSeconds)
 	viper.SetDefault(NodeExpandRetryIntervalSecondsVar, defaultNodeExpandRetryIntervalSeconds)
 	viper.SetDefault(NodeExpandSizeToleranceBytesVar, defaultNodeExpandSizeToleranceBytes)
-	viper.SetDefault(NodeDeviceCacheEnabledVar, defaultNodeDeviceCacheEnabled)
-	viper.SetDefault(NodeDeviceCacheTTLSecondsVar, defaultNodeDeviceCacheTTLSeconds)
 	viper.SetDefault(NodeDeviceUdevSettleTimeoutSecondsVar, defaultNodeDeviceUdevSettleTimeoutSeconds)
 	viper.SetDefault(NodeDeviceRescanOnMissEnabledVar, defaultNodeDeviceRescanOnMissEnabled)
 	viper.SetDefault(HotplugQueueEnabledVar, defaultHotplugQueueEnabled)

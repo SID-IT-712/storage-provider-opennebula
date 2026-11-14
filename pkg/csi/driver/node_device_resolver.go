@@ -33,37 +33,17 @@ const (
 	publishContextOpenNebulaImageID = "opennebulaImageID"
 )
 
-// nodeDeviceCacheEntry caches a device for a request WITHOUT a serial. A serial
-// request never uses the cache: locateBySerial is a cheap sysfs read and is the
-// proof itself.
-type nodeDeviceCacheEntry struct {
-	VolumeID        string
-	ImageID         string
-	DevicePath      string
-	LastConfirmedAt time.Time
-}
-
+// NodeDeviceResolver finds a volume's block device by the serial OpenNebula gave
+// its disk (onecsi-<imageID>), and only by that serial.
 type NodeDeviceResolver struct {
-	exec               utilexec.Interface
-	cacheEnabled       bool
-	cacheTTL           time.Duration
-	udevSettleTimeout  time.Duration
-	rescanOnMiss       bool
-	deviceCandidatesFn func(volumeName string) []string
-	mu                 sync.RWMutex
-	cache              map[string]nodeDeviceCacheEntry
-	udevadmMissingLog  bool
+	exec              utilexec.Interface
+	udevSettleTimeout time.Duration
+	rescanOnMiss      bool
+	mu                sync.Mutex
+	udevadmMissingLog bool
 }
 
-func NewNodeDeviceResolver(cfg config.CSIPluginConfig, exec utilexec.Interface, candidatesFn func(volumeName string) []string) *NodeDeviceResolver {
-	cacheEnabled, ok := cfg.GetBool(config.NodeDeviceCacheEnabledVar)
-	if !ok {
-		cacheEnabled = true
-	}
-	cacheTTLSeconds, ok := cfg.GetInt(config.NodeDeviceCacheTTLSecondsVar)
-	if !ok || cacheTTLSeconds <= 0 {
-		cacheTTLSeconds = 600
-	}
+func NewNodeDeviceResolver(cfg config.CSIPluginConfig, exec utilexec.Interface) *NodeDeviceResolver {
 	udevSettleTimeoutSeconds, ok := cfg.GetInt(config.NodeDeviceUdevSettleTimeoutSecondsVar)
 	if !ok {
 		udevSettleTimeoutSeconds = 10
@@ -73,59 +53,32 @@ func NewNodeDeviceResolver(cfg config.CSIPluginConfig, exec utilexec.Interface, 
 		rescanOnMiss = true
 	}
 	return &NodeDeviceResolver{
-		exec:               exec,
-		cacheEnabled:       cacheEnabled,
-		cacheTTL:           time.Duration(cacheTTLSeconds) * time.Second,
-		udevSettleTimeout:  time.Duration(udevSettleTimeoutSeconds) * time.Second,
-		rescanOnMiss:       rescanOnMiss,
-		deviceCandidatesFn: candidatesFn,
-		cache:              map[string]nodeDeviceCacheEntry{},
+		exec:              exec,
+		udevSettleTimeout: time.Duration(udevSettleTimeoutSeconds) * time.Second,
+		rescanOnMiss:      rescanOnMiss,
 	}
 }
 
+// Resolve returns the device that provably carries the publish context's
+// deviceSerial. A context without one is refused (errNoDeviceSerial): it is
+// never resolved by volumeName, the disk's OpenNebula TARGET.
+// @gotcha: TARGET is not the guest's kernel name (the context CD-ROM shifts it,
+// and hot-plug churn drifts it further), so /dev/<TARGET> or its vd/xvd alias can
+// be another volume's disk, possibly mounted. Guessing it once staged one
+// volume's filesystem for another. Nothing is cached: every call is proven again.
 func (r *NodeDeviceResolver) Resolve(ctx context.Context, volumeID, volumeName string, publishContext map[string]string, timeout time.Duration) (string, deviceResolutionResult, error) {
 	started := deviceResolverNow()
 	serial := strings.TrimSpace(publishContext[publishContextDeviceSerial])
-	imageID := strings.TrimSpace(publishContext[publishContextOpenNebulaImageID])
-	if serial != "" {
-		return r.resolveSerial(ctx, volumeName, serial, started, timeout)
+	if serial == "" {
+		return "", deviceResolutionResult{}, noDeviceSerialError(volumeID, volumeName)
 	}
-	if volumeID != "" {
-		if devicePath, ok := r.resolveFromCache(volumeID); ok {
-			return devicePath, deviceResolutionResult{ResolvedBy: "cache", Latency: deviceResolverNow().Sub(started)}, nil
-		}
-	}
-	if devicePath, result, err := r.resolveAlias(volumeName, started); err == nil {
-		r.remember(volumeID, imageID, devicePath)
-		return devicePath, result, nil
-	}
+	return r.resolveSerial(ctx, volumeName, serial, started, timeout)
+}
 
-	deadline := deviceResolverNow().Add(timeout)
-	for {
-		if timeout > 0 && deviceResolverNow().After(deadline) {
-			break
-		}
-		r.runRecoverySequence(ctx)
-		if devicePath, result, err := r.resolveAlias(volumeName, started); err == nil {
-			r.remember(volumeID, imageID, devicePath)
-			if result.ResolvedBy == "exact" {
-				result.ResolvedBy = "exact-recovery"
-			} else {
-				result.ResolvedBy = "alias-recovery"
-			}
-			return devicePath, result, nil
-		}
-		if timeout <= 0 {
-			break
-		}
-		nodeDeviceSleep(defaultNodeDevicePollPeriod)
-	}
-
-	candidates := []string{}
-	if r.deviceCandidatesFn != nil {
-		candidates = r.deviceCandidatesFn(volumeName)
-	}
-	return "", deviceResolutionResult{}, fmt.Errorf("timed out after %s waiting for device path for volume %q (checked %s)", timeout, volumeName, strings.Join(candidates, ", "))
+// noDeviceSerialError is the refusal for a publish context with no deviceSerial.
+func noDeviceSerialError(volumeID, volumeName string) error {
+	return fmt.Errorf("%w (volume %q, TARGET %q); re-attach the volume so the controller publishes its serial",
+		errNoDeviceSerial, volumeID, volumeName)
 }
 
 // resolveSerial resolves a request that carries a device serial, through
@@ -161,41 +114,6 @@ func (r *NodeDeviceResolver) resolveSerial(ctx context.Context, volumeName, seri
 		kind: kindOf(err),
 		msg:  fmt.Sprintf("after %s: %v (TARGET %s is not used for serial requests)", timeout, err, volumeName),
 	}
-}
-
-func (r *NodeDeviceResolver) Invalidate(volumeID string) {
-	if r == nil || strings.TrimSpace(volumeID) == "" {
-		return
-	}
-	r.mu.Lock()
-	delete(r.cache, volumeID)
-	r.mu.Unlock()
-}
-
-// resolveFromCache returns a cached device for a request without a serial.
-func (r *NodeDeviceResolver) resolveFromCache(volumeID string) (string, bool) {
-	if r == nil || !r.cacheEnabled || strings.TrimSpace(volumeID) == "" {
-		return "", false
-	}
-	r.mu.RLock()
-	entry, ok := r.cache[volumeID]
-	r.mu.RUnlock()
-	if !ok {
-		return "", false
-	}
-	if r.cacheTTL > 0 && deviceResolverNow().Sub(entry.LastConfirmedAt) > r.cacheTTL {
-		r.Invalidate(volumeID)
-		return "", false
-	}
-	if entry.DevicePath == "" {
-		r.Invalidate(volumeID)
-		return "", false
-	}
-	if _, err := nodeVolumePathStat(entry.DevicePath); err != nil {
-		r.Invalidate(volumeID)
-		return "", false
-	}
-	return entry.DevicePath, true
 }
 
 // deviceProof says how a device was proven to carry a requested serial.
@@ -235,6 +153,9 @@ var (
 	errSerialAmbiguous = errors.New("serial ambiguous")
 	// errNoDeviceResolver: nothing can prove a serial without the resolver.
 	errNoDeviceResolver = errors.New("no device resolver")
+	// errNoDeviceSerial: the publish context names no serial, so nothing can be
+	// proven. A refusal (FailedPrecondition), never a guess by target name.
+	errNoDeviceSerial = errors.New("publish context has no deviceSerial; refusing to resolve by target name")
 )
 
 // locateError carries a readable message and a sentinel kind for errors.Is.
@@ -424,33 +345,6 @@ func byIDNameHasSerial(base, serial string) bool {
 	return base == serial || base == "virtio-"+serial || strings.HasSuffix(base, "_"+serial)
 }
 
-func (r *NodeDeviceResolver) resolveAlias(volumeName string, started time.Time) (string, deviceResolutionResult, error) {
-	candidates := []string{}
-	if r.deviceCandidatesFn != nil {
-		candidates = r.deviceCandidatesFn(volumeName)
-	}
-	expected := pathJoin(defaultDiskPath, filepath.Base(volumeName))
-	var lastErr error
-	for _, candidate := range candidates {
-		if _, err := nodeVolumePathStat(candidate); err == nil {
-			result := deviceResolutionResult{
-				ResolvedBy: "exact",
-				Latency:    deviceResolverNow().Sub(started),
-			}
-			if candidate != expected {
-				result.ResolvedBy = "alias"
-			}
-			return candidate, result, nil
-		} else if !os.IsNotExist(err) {
-			lastErr = err
-		}
-	}
-	if lastErr != nil {
-		return "", deviceResolutionResult{}, lastErr
-	}
-	return "", deviceResolutionResult{}, fmt.Errorf("device not found")
-}
-
 func (r *NodeDeviceResolver) runRecoverySequence(ctx context.Context) {
 	if r == nil || r.exec == nil {
 		return
@@ -495,20 +389,6 @@ func (r *NodeDeviceResolver) markUdevadmMissingLogged() bool {
 	}
 	r.udevadmMissingLog = true
 	return true
-}
-
-func (r *NodeDeviceResolver) remember(volumeID, imageID, devicePath string) {
-	if r == nil || !r.cacheEnabled || strings.TrimSpace(volumeID) == "" || strings.TrimSpace(devicePath) == "" {
-		return
-	}
-	r.mu.Lock()
-	r.cache[volumeID] = nodeDeviceCacheEntry{
-		VolumeID:        volumeID,
-		ImageID:         imageID,
-		DevicePath:      devicePath,
-		LastConfirmedAt: deviceResolverNow().UTC(),
-	}
-	r.mu.Unlock()
 }
 
 type serialEvidence int
@@ -626,8 +506,4 @@ func parseVPDPage80(raw []byte) string {
 
 func trimDeviceSerial(value string) string {
 	return strings.Trim(value, " \t\r\n\x00")
-}
-
-func pathJoin(parts ...string) string {
-	return filepath.Join(parts...)
 }

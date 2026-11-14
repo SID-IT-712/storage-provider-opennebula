@@ -383,11 +383,12 @@ func TestPublishContextForVolumeIncludesDedicatedDeviceDiscoveryTimeout(t *testi
 	mockProvider := &MockOpenNebulaVolumeProviderTestify{}
 	cs := getTestControllerServer(mockProvider)
 
-	publishContext := cs.publishContextForVolume(context.Background(), "pvc-1", "sdd", 30*time.Second, map[string]string{
+	publishContext, err := cs.publishContextForVolume(context.Background(), "pvc-1", 1, "sdd", 30*time.Second, map[string]string{
 		paramPVCName:      "data-pvc",
 		paramPVCNamespace: "default",
 		paramPVName:       "pv-data-pvc",
 	})
+	require.NoError(t, err)
 
 	assert.Equal(t, "sdd", publishContext["volumeName"])
 	assert.Equal(t, "180", publishContext[publishContextHotplugTimeoutSeconds])
@@ -397,6 +398,73 @@ func TestPublishContextForVolumeIncludesDedicatedDeviceDiscoveryTimeout(t *testi
 	assert.Equal(t, "data-pvc", publishContext[paramPVCName])
 	assert.Equal(t, "default", publishContext[paramPVCNamespace])
 	assert.Equal(t, "pv-data-pvc", publishContext[paramPVName])
+}
+
+// A publish context without deviceSerial makes the node guess the disk by its
+// OpenNebula TARGET, which can be another volume's disk. When the serial cannot
+// be built (no valid image id), there is no context at all.
+func TestPublishContextForVolumeFailsWithoutSerial(t *testing.T) {
+	cs := getTestControllerServer(&MockOpenNebulaVolumeProviderTestify{})
+
+	publishContext, err := cs.publishContextForVolume(context.Background(), "pvc-1", -1, "sdd", 0, nil)
+
+	require.Error(t, err)
+	assert.Equal(t, codes.Unavailable, status.Code(err))
+	assert.Contains(t, err.Error(), "deviceSerial")
+	assert.Nil(t, publishContext)
+}
+
+// Image 0 is a valid OpenNebula image; its disk carries serial onecsi-0.
+func TestPublishContextForVolumeSerialForImageZero(t *testing.T) {
+	cs := getTestControllerServer(&MockOpenNebulaVolumeProviderTestify{})
+
+	publishContext, err := cs.publishContextForVolume(context.Background(), "pvc-0", 0, "sdd", 0, nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, "onecsi-0", publishContext[publishContextDeviceSerial])
+	assert.Equal(t, "0", publishContext[publishContextOpenNebulaImageID])
+}
+
+// The serial comes from the image id ControllerPublishVolume already resolved:
+// there is no second VolumeExists call that could fail (and once dropped the
+// serial). A failing second lookup is registered but never reached.
+func TestControllerPublishVolumeSerialNeedsNoSecondImageLookup(t *testing.T) {
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-serial").Return(2936, 1, nil).Once()
+	mockProvider.On("VolumeExists", mock.Anything, "vol-serial").Return(-1, -1, errors.New("one.image.info: timeout")).Maybe()
+	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(7, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 2936, 7).Return("", errors.New("volume not attached to node")).Twice()
+	mockProvider.On("AttachVolume", mock.Anything, "vol-serial", "node-1", false, mock.Anything).Return(nil).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 2936, 7).Return("sdad", nil).Once()
+	cs := getTestControllerServer(mockProvider)
+
+	resp, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-serial", "node-1"))
+
+	require.NoError(t, err)
+	assert.Equal(t, "onecsi-2936", resp.GetPublishContext()[publishContextDeviceSerial])
+	assert.Equal(t, "2936", resp.GetPublishContext()[publishContextOpenNebulaImageID])
+	assert.Equal(t, "sdad", resp.GetPublishContext()["volumeName"])
+	mockProvider.AssertNumberOfCalls(t, "VolumeExists", 1)
+	mockProvider.AssertExpectations(t)
+}
+
+// The already-attached path (the attacher's retry after a failed publish) only
+// builds the context, with one image lookup and no second attach.
+func TestControllerPublishVolumeAlreadyAttachedIsIdempotent(t *testing.T) {
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-serial").Return(2936, 1, nil).Once()
+	mockProvider.On("VolumeExists", mock.Anything, "vol-serial").Return(-1, -1, errors.New("one.image.info: timeout")).Maybe()
+	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(7, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 2936, 7).Return("sdad", nil).Once()
+	cs := getTestControllerServer(mockProvider)
+
+	resp, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-serial", "node-1"))
+
+	require.NoError(t, err)
+	assert.Equal(t, "onecsi-2936", resp.GetPublishContext()[publishContextDeviceSerial])
+	mockProvider.AssertNumberOfCalls(t, "VolumeExists", 1)
+	mockProvider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	mockProvider.AssertExpectations(t)
 }
 
 func TestNodeDeviceDiscoveryTimeoutCapsToHotplugTimeout(t *testing.T) {
@@ -1865,6 +1933,40 @@ func TestControllerPublishVolumeReusesStickyAttachmentOnSameNode(t *testing.T) {
 	assert.False(t, ok)
 	mockProvider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	mockProvider.AssertNotCalled(t, "DetachVolume", mock.Anything, mock.Anything, mock.Anything)
+	mockProvider.AssertExpectations(t)
+}
+
+// Same-node sticky reuse publishes the serial from the already-known image id.
+func TestControllerPublishVolumeStickyReusePublishesSerial(t *testing.T) {
+	pv, pvc := newLocalPVAndPVC("vol-reuse", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, map[string]string{
+		annotationRestartOpt: restartOptimizationAnnotationValue,
+	})
+	driver := newStickyTestDriver(t, pv, pvc)
+	require.NoError(t, driver.stickyAttachments.StartGrace(StickyAttachmentState{
+		VolumeID:     "vol-reuse",
+		NodeID:       "node-1",
+		Backend:      "local",
+		PVCNamespace: "default",
+		PVCName:      "pvc-vol-reuse",
+		StartedAt:    time.Now().Add(-10 * time.Second),
+		ExpiresAt:    time.Now().Add(90 * time.Second),
+		GraceSeconds: 90,
+		Reason:       "stateful_restart",
+	}))
+
+	mockProvider := new(MockOpenNebulaVolumeProviderTestify)
+	mockProvider.On("VolumeExists", mock.Anything, "vol-reuse").Return(5, 1, nil).Once()
+	mockProvider.On("VolumeExists", mock.Anything, "vol-reuse").Return(-1, -1, errors.New("one.image.info: timeout")).Maybe()
+	mockProvider.On("NodeExists", mock.Anything, "node-1").Return(41, nil)
+	mockProvider.On("GetVolumeInNode", mock.Anything, 5, 41).Return("", fmt.Errorf("not attached")).Once()
+	mockProvider.On("GetVolumeInNode", mock.Anything, 5, 41).Return("vdc", nil).Once()
+
+	cs := getTestControllerServerWithDriver(mockProvider, &MockSharedFilesystemProviderTestify{}, driver)
+	resp, err := cs.ControllerPublishVolume(context.Background(), newPublishReq("vol-reuse", "node-1"))
+	require.NoError(t, err)
+	assert.Equal(t, "onecsi-5", resp.GetPublishContext()[publishContextDeviceSerial])
+	mockProvider.AssertNumberOfCalls(t, "VolumeExists", 1)
+	mockProvider.AssertNotCalled(t, "AttachVolume", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	mockProvider.AssertExpectations(t)
 }
 
