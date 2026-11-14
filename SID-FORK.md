@@ -296,14 +296,15 @@ time and the new pod wrote into it. No mkfs ran (blkid saw a filesystem), but
 the pod's fsGroup re-owned the other volume's root.
 
 **What changed.**
-- **Controller.** `publishContextForVolume` returns an error when it cannot
-  determine the image: `ControllerPublishVolume` fails with `Unavailable` and logs
-  the volume id at error level. It never returns a context without
-  `deviceSerial`. Image 0 now gets `onecsi-0` (its disk has that serial; the old
-  `> 0` check dropped it). Every caller propagates the error: the
-  already-attached path, the attach path, and same-node sticky reuse (which now
-  builds the context before clearing its sticky state, so the retry can still
-  reuse). A failure after a successful attach leaves the disk attached in
+- **Controller.** `publishContextForVolume` takes the image id that
+  `ControllerPublishVolume` already resolved and no longer calls `VolumeExists`
+  a second time, so the lookup whose failure dropped the serial is gone. It
+  never returns a context without `deviceSerial`: an invalid image id is an
+  `Unavailable` error, logged with the volume id at error level. Image 0 now gets
+  `onecsi-0` (its disk has that serial; the old `> 0` check dropped it). Every
+  caller propagates the error: the already-attached path, the attach path, and
+  same-node sticky reuse (which builds the context before clearing its sticky
+  state). A failure after a successful attach leaves the disk attached in
   OpenNebula; the attacher's retry finds it with `GetVolumeInNode` and only builds
   the context, so it is idempotent and never attaches twice.
 - **Node resolver.** A publish context without `deviceSerial` is refused with
@@ -313,14 +314,24 @@ the pod's fsGroup re-owned the other volume's root.
   local RWO recovery. `requireSerialProof` refuses a missing serial instead of
   passing it. The target-name alias resolution and the device cache it fed are
   removed: a serial request never used the cache, and nothing else is left to
-  use it. `ONE_CSI_NODE_DEVICE_CACHE_ENABLED` / `_TTL_SECONDS` are no longer read
-  (upstream's chart still sets them; harmless). With a serial, resolution is
-  unchanged: kernel serial, then exact by-id.
+  use it. `ONE_CSI_NODE_DEVICE_CACHE_ENABLED` / `_TTL_SECONDS` and the chart's
+  `driver.nodeDeviceCache.enabled` / `ttlSeconds` are removed, and so is the
+  `opennebula_csi_device_cache_total` metric; the `DeviceCacheMiss` PVC event is
+  now `DeviceSerialResolved`. With a serial, resolution is unchanged: kernel
+  serial, then exact by-id.
 - **NodeStage.** Before formatting or mounting, `refuseDeviceMountedElsewhere`
-  reads the mount table through the mounter and refuses (`FailedPrecondition`,
-  naming both paths) a device mounted at any path other than this volume's
-  staging path. The idempotent case (already staged at this path, even with pod
-  bind mounts) still succeeds before the check. After `FormatAndMount` the check
+  reads the mount table through the mounter and attributes every other mount of
+  the device: a kubelet pod target names its PV in the path
+  (`.../pods/<uid>/volumes/kubernetes.io~csi/<pv>/mount`), and a staging dir has
+  kubelet's `vol_data.json` beside its `globalmount` naming the volume handle.
+  This volume's own mounts (PV equal to the context's
+  `csi.storage.k8s.io/pv/name` or to the volume id, or a matching handle) are
+  allowed. Another volume's, and any mount that cannot be attributed, are refused
+  (`FailedPrecondition`, naming both paths). The idempotent case (already staged
+  at this path, even with pod bind mounts) still succeeds before the check, and
+  `checkMountPoint` now compares paths after `Clean` and symlink resolution and
+  devices as block devices, so a differently spelled staging path is still
+  recognised. After `FormatAndMount` the check
   runs again; a device found mounted elsewhere unmounts the new stage and fails.
   A format/mount error saying the device is mounted is a `FailedPrecondition`
   refusal. Local RWO recovery runs the same check before its remount.
@@ -343,9 +354,9 @@ is no opt-out flag.
 
 Tests: `TestPublishContextForVolumeFailsWithoutSerial`,
 `TestPublishContextForVolumeSerialForImageZero`,
-`TestControllerPublishVolumeFailsClosedWithoutSerialAndRetryIsIdempotent`,
-`TestControllerPublishVolumeAlreadyAttachedFailsClosedWithoutSerial`,
-`TestControllerPublishVolumeStickyReuseFailsClosedWithoutSerial`
+`TestControllerPublishVolumeSerialNeedsNoSecondImageLookup`,
+`TestControllerPublishVolumeAlreadyAttachedIsIdempotent`,
+`TestControllerPublishVolumeStickyReusePublishesSerial`
 (`controllerserver_test.go`); `TestNodeDeviceResolverRefusesContextWithoutSerial`,
 `TestNodeDeviceResolverIncidentResolvesBySerialNotTarget`,
 `TestNodeDeviceResolverProvesSerialOnEveryCall` (`node_device_resolver_test.go`);
@@ -353,12 +364,15 @@ Tests: `TestPublishContextForVolumeFailsWithoutSerial`,
 `TestStageVolumeRefusesDeviceMountedElsewhereAfterMount`,
 `TestStageVolumeTreatsDeviceIsMountedAsFatal`,
 `TestRefuseDeviceMountedElsewhereMatchesStagingPathSpellings`,
+`TestStageVolumeIdempotentWithSymlinkedStagingAndPodBind`,
+`TestStageVolumeAttributesMountsOfTheDevice`,
 `TestMountErrorSaysDeviceMounted` (`nodeserver_test.go`);
 `TestResolveWithoutSerialRefusesAlias`, `TestRequireSerialProof`
 (`node_kernel_serial_test.go`); `TestLocalDiskRecoveryRefusesUnprovenOrBusyDevice`
 (`nodeserver_stage_grow_test.go`).
-**Chart:** no change.
-**Upstreamable:** yes, one code-only `fix(csi):` commit. Upstream's master has
+**Chart:** the dead `nodeDeviceCache.enabled` / `ttlSeconds` values and their
+env vars are removed.
+**Upstreamable:** yes, as code-only `fix(csi):` commits. Upstream's master has
 the same silent drop and also resolves by alias when a serial is present, so an
 upstream PR needs fix 2 first.
 
@@ -374,7 +388,7 @@ upstream PR needs fix 2 first.
 | `fix/stage-resize-fs` | fix 5's PR branch (base `sid/release`) | One code-only `fix(node):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
 | `fix/dead-owner-reattach` | fix 6's PR branch (base `sid/release`) | One code-only `fix(controller):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
 | `fix/…-leader-gate-capabilities` | fixes 7 and 8's PR branch (base `sid/release`) | Two code-only `fix(controller):` commits plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
-| `fix/op-1319-serial-proof` | fix 9's PR branch (base `sid/release`) | One code-only `fix(csi):` commit plus a `docs(sid):` commit for this file. Merge with a rebase or a merge commit, never a squash. |
+| `fix/op-1319-serial-proof` | fix 9's PR branch (base `sid/release`) | Code-only `fix(csi):` commits plus `docs(sid):` commits for this file. Merge with a rebase or a merge commit, never a squash. |
 | `sid/release` | every fix **plus** this file and our workflows | Our deploy line. Images are built from here. Never merge it into a fix branch. |
 
 ## Images
