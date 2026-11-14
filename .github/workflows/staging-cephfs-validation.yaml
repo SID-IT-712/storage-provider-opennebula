@@ -41,13 +41,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Require BUILDKIT_ENDPOINT
+        env:
+          BUILDKIT_ENDPOINT: ${{ vars.BUILDKIT_ENDPOINT }}
+        run: |
+          [ -n "$BUILDKIT_ENDPOINT" ] || { echo "::error::repository variable BUILDKIT_ENDPOINT is not set"; exit 1; }
+
       # @why: no Docker daemon on the pool; buildx uses the `remote` driver against the shared
       #   BuildKit (mTLS client cert at /certs/buildkit).
       - name: Set up Docker Buildx (remote BuildKit)
         uses: docker/setup-buildx-action@v3
         with:
           driver: remote
-          endpoint: tcp://buildkitd.arc-builders.svc.cluster.local:1234
+          endpoint: ${{ vars.BUILDKIT_ENDPOINT }}
           platforms: linux/amd64
           driver-opts: |
             cacert=/certs/buildkit/ca.crt
