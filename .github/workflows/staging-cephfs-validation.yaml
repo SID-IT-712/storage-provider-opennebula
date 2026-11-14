@@ -23,7 +23,8 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    # @why: dispatch only, runs on the runner pool (no hosted fallback).
+    runs-on: [self-hosted, sid-cluster]
     env:
       VALUES_FILE: ${{ inputs.values_file }}
       NAMESPACE: ${{ inputs.namespace }}
@@ -40,8 +41,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
+      # @why: no Docker daemon on the pool; buildx uses the `remote` driver against the shared
+      #   BuildKit (mTLS client cert at /certs/buildkit).
+      - name: Set up Docker Buildx (remote BuildKit)
         uses: docker/setup-buildx-action@v3
+        with:
+          driver: remote
+          endpoint: tcp://buildkitd.arc-builders.svc.cluster.local:1234
+          platforms: linux/amd64
+          driver-opts: |
+            cacert=/certs/buildkit/ca.crt
+            cert=/certs/buildkit/tls.crt
+            key=/certs/buildkit/tls.key
 
       - name: Login to GHCR
         uses: docker/login-action@v3

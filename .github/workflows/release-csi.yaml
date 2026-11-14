@@ -11,7 +11,11 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    # @gotcha: moved to the runner pool, but NOT yet runnable there: the job calls `make`
+    #   (not in the runner image yet), `docker-release-*` needs a Docker daemon (the pool has
+    #   only a remote BuildKit) and QEMU for arm64. This tag pattern never fires for this fork
+    #   (tags are sid-v*, see sid-image.yaml), so nothing breaks; fix before ever using it.
+    runs-on: [self-hosted, sid-cluster]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
