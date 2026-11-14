@@ -22,6 +22,8 @@ concurrency:
 jobs:
   lint:
     name: lint
+    # @why: public repo: a pull request from a fork never reaches the runner pool (no hosted fallback either); only pushes, tags, dispatches and same-repo PRs run.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, sid-cluster]
     timeout-minutes: 20
     steps:
@@ -53,6 +55,8 @@ jobs:
 
   test:
     name: test
+    # @why: public repo: a pull request from a fork never reaches the runner pool (no hosted fallback either); only pushes, tags, dispatches and same-repo PRs run.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, sid-cluster]
     timeout-minutes: 20
     steps:

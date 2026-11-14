@@ -89,6 +89,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Require BUILDKIT_ENDPOINT
+        env:
+          BUILDKIT_ENDPOINT: ${{ vars.BUILDKIT_ENDPOINT }}
+        run: |
+          [ -n "$BUILDKIT_ENDPOINT" ] || { echo "::error::repository variable BUILDKIT_ENDPOINT is not set"; exit 1; }
+
       # @why: no Docker daemon on the cluster pool, so buildx uses the `remote`
       # driver against the shared rootful BuildKit in arc-builders (mTLS client
       # cert mounted at /certs/buildkit). Same snippet as the chart repo's ci.yml.
@@ -96,7 +102,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
         with:
           driver: remote
-          endpoint: tcp://buildkitd.arc-builders.svc.cluster.local:1234
+          endpoint: ${{ vars.BUILDKIT_ENDPOINT }}
           platforms: linux/amd64
           driver-opts: |
             cacert=/certs/buildkit/ca.crt
