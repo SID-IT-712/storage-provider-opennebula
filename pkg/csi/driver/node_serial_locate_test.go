@@ -108,7 +108,7 @@ func TestResolveFindsDiskBySysfsAmongSidLabDevices(t *testing.T) {
 	steppingResolverClock(t)
 	sidLabWorker(t, root, diskPath)
 	// no /dev/disk/by-id at all: udev lag, or no udev db in the container
-	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec(), nil)
+	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec())
 
 	path, _, err := r.Resolve(context.Background(), "vol-1", "sdc", map[string]string{publishContextDeviceSerial: "onecsi-40"}, 0)
 	require.NoError(t, err)
@@ -138,7 +138,7 @@ func TestResolveRefusesAmbiguousKernelSerial(t *testing.T) {
 		writeDisk(t, diskPath, name)
 		writeSysfsVPD80(t, root, name, vpdPage80("onecsi-11"))
 	}
-	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec(), nil)
+	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec())
 	_, _, err := r.Resolve(context.Background(), "vol-1", "sdc", map[string]string{publishContextDeviceSerial: "onecsi-11"}, 0)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "ambiguous: sdb, sdc carry serial onecsi-11")
@@ -150,9 +150,7 @@ func TestResolveSerialTimeoutNamesWhatWasSearched(t *testing.T) {
 	diskPath := withTestDiskPath(t)
 	steppingResolverClock(t)
 	writeDisk(t, diskPath, "sdc")
-	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec(), func(string) []string {
-		return []string{filepath.Join(diskPath, "sdc")}
-	})
+	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec())
 	_, _, err := r.Resolve(context.Background(), "vol-1", "sdc", map[string]string{publishContextDeviceSerial: "onecsi-11"}, 2*time.Second)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "carries serial onecsi-11, and no")
@@ -308,7 +306,7 @@ func TestReportAgreesWithResolverOnStaleByIDLink(t *testing.T) {
 	writeSysfsVPD80(t, root, "sdb", vpdPage80("onecsi-99"))
 	writeSysfsVPD80(t, root, "sdc", vpdPage80("onecsi-11"))
 	linkByID(t, diskPath, "scsi-0QEMU_QEMU_HARDDISK_onecsi-11", "sdb")
-	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec(), nil)
+	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec())
 
 	path, _, err := r.Resolve(context.Background(), "", "sdc", map[string]string{publishContextDeviceSerial: "onecsi-11"}, 0)
 	require.NoError(t, err)
@@ -327,7 +325,7 @@ func TestRecoverySequenceRescansUnderSysfsRoot(t *testing.T) {
 	cfg := config.LoadConfiguration()
 	cfg.OverrideVal(config.NodeDeviceRescanOnMissEnabledVar, true)
 	cfg.OverrideVal(config.NodeDeviceUdevSettleTimeoutSecondsVar, 0)
-	r := NewNodeDeviceResolver(cfg, newRecordingExec(), nil)
+	r := NewNodeDeviceResolver(cfg, newRecordingExec())
 
 	r.runRecoverySequence(context.Background())
 	got, err := os.ReadFile(scan)
@@ -351,7 +349,7 @@ func TestLocateKernelMatchNeverFallsBackToByID(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errSerialNotYet)
 
-	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec(), nil)
+	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec())
 	path, _, err := r.Resolve(context.Background(), "vol-1", "sdc", map[string]string{publishContextDeviceSerial: "onecsi-11"}, 3*time.Second)
 	require.Error(t, err, "resolved %s", path)
 	assert.Empty(t, path)
@@ -407,7 +405,7 @@ func TestResolveRetriesAmbiguityUntilStaleTwinDisappears(t *testing.T) {
 	originalSleep := nodeDeviceSleep
 	nodeDeviceSleep = func(time.Duration) { _ = os.RemoveAll(filepath.Join(root, "block", "sdb")) }
 	t.Cleanup(func() { nodeDeviceSleep = originalSleep })
-	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec(), nil)
+	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec())
 
 	path, resolution, err := r.Resolve(context.Background(), "vol-1", "sdc", map[string]string{publishContextDeviceSerial: "onecsi-11"}, 10*time.Second)
 	require.NoError(t, err)

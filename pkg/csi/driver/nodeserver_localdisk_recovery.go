@@ -345,6 +345,9 @@ func (ns *NodeServer) recoverLocalDiskSession(ctx context.Context, session local
 	if fsType == "" {
 		fsType = defaultFSType
 	}
+	if err := ns.refuseDeviceMountedElsewhere(devicePath, session.StagingTargetPath); err != nil {
+		return ns.recordLocalDiskRecoveryFailure(session, err)
+	}
 	if err := ns.mounter.FormatAndMount(devicePath, session.StagingTargetPath, fsType, session.StageMountOptions); err != nil {
 		return ns.recordLocalDiskRecoveryFailure(session, fmt.Errorf("failed to remount recovered device %s at %s: %w", devicePath, session.StagingTargetPath, err))
 	}

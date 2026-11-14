@@ -19,7 +19,6 @@ const (
 	eventReasonDeviceDiscoverySlow          = "DeviceDiscoverySlow"
 	eventReasonDeviceDiscoveryTimeout       = "DeviceDiscoveryTimeout"
 	eventReasonDeviceIdentityRefused        = "DeviceIdentityRefused"
-	eventReasonDeviceCacheHit               = "DeviceCacheHit"
 	eventReasonDeviceCacheMiss              = "DeviceCacheMiss"
 	eventReasonDeviceByIDResolved           = "DeviceByIDResolved"
 	eventReasonDetachGraceStarted           = "DetachGraceStarted"

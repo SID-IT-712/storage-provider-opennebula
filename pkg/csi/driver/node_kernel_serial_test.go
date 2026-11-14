@@ -312,7 +312,13 @@ func TestRequireSerialProof(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	assert.NoError(t, requireSerialProof(ctx, "/dev/sdb", deviceResolutionResult{Proof: proofKernel}))
-	assert.NoError(t, requireSerialProof(map[string]string{}, "/dev/sdc", deviceResolutionResult{ResolvedBy: "alias"}))
+	// No serial is never a pass, whatever the resolution claims.
+	for _, resolution := range []deviceResolutionResult{{ResolvedBy: "exact"}, {ResolvedBy: "alias"}, {Proof: proofKernel}} {
+		err = requireSerialProof(map[string]string{"volumeName": "sdc"}, "/dev/sdc", resolution)
+		require.Error(t, err)
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err))
+		assert.Contains(t, err.Error(), "publish context has no deviceSerial")
+	}
 }
 
 // onecsi-43 must never bind onecsi-439's disk, whatever order the by-id glob
@@ -340,7 +346,7 @@ func TestResolveByIDPrefixCollision(t *testing.T) {
 				}
 				return m, err
 			}
-			r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec(), nil)
+			r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec())
 			got, err := locateBySerial(r.exec, "onecsi-43")
 			nodeByIDGlob = original
 			require.NoError(t, err, "sysfs=%v reversed=%v", withSysfs, reversed)
@@ -349,37 +355,17 @@ func TestResolveByIDPrefixCollision(t *testing.T) {
 	}
 }
 
-// A serial request never uses the cache: a cached device that now carries
-// another volume's serial is not returned.
-func TestResolveSerialIgnoresCache(t *testing.T) {
-	root := withTestSysfs(t)
-	diskPath := withTestDiskPath(t)
-	steppingResolverClock(t)
-	stale := writeDisk(t, diskPath, "sdb")
-	want := writeDisk(t, diskPath, "sdc")
-	writeSysfsVPD80(t, root, "sdb", vpdPage80("onecsi-77"))
-	writeSysfsVPD80(t, root, "sdc", vpdPage80("onecsi-42"))
-	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec(), nil)
-	r.remember("vol-1", "42", stale)
-
-	path, resolution, err := r.Resolve(context.Background(), "vol-1", "sdc", map[string]string{publishContextDeviceSerial: "onecsi-42"}, time.Second)
-	require.NoError(t, err)
-	assert.Equal(t, want, path)
-	assert.Equal(t, "kernel-serial", resolution.ResolvedBy)
-}
-
-// Requests that carry no serial keep the alias behaviour.
-func TestResolveWithoutSerialKeepsAlias(t *testing.T) {
+// A request without a serial is refused, even when a target-name candidate
+// (here the virtio alias vde of TARGET sde) exists.
+func TestResolveWithoutSerialRefusesAlias(t *testing.T) {
 	withTestSysfs(t)
 	diskPath := withTestDiskPath(t)
 	steppingResolverClock(t)
-	vde := filepath.Join(diskPath, "vde")
-	require.NoError(t, os.WriteFile(vde, []byte("x"), 0o644))
-	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec(), func(string) []string {
-		return []string{filepath.Join(diskPath, "sde"), vde}
-	})
-	path, resolution, err := r.Resolve(context.Background(), "vol-1", "sde", map[string]string{}, time.Second)
-	require.NoError(t, err)
-	assert.Equal(t, vde, path)
-	assert.Equal(t, "alias", resolution.ResolvedBy)
+	require.NoError(t, os.WriteFile(filepath.Join(diskPath, "vde"), []byte("x"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(diskPath, "sde"), []byte("x"), 0o644))
+	r := NewNodeDeviceResolver(getTestNodeServer(nil).Driver.PluginConfig, newRecordingExec())
+	path, _, err := r.Resolve(context.Background(), "vol-1", "sde", map[string]string{}, time.Second)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, errNoDeviceSerial)
+	assert.Empty(t, path)
 }

@@ -21,11 +21,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -94,9 +92,8 @@ func NewNodeServer(d *Driver, mounter *mount.SafeFormatAndMount) *NodeServer {
 	ns := &NodeServer{
 		Driver:         d,
 		mounter:        mounter,
-		deviceResolver: NewNodeDeviceResolver(d.PluginConfig, mounter.Exec, nil),
+		deviceResolver: NewNodeDeviceResolver(d.PluginConfig, mounter.Exec),
 	}
-	ns.deviceResolver.deviceCandidatesFn = ns.deviceCandidates
 	ns.sharedFilesystemRecovery = newSharedFilesystemRecoveryManager(ns)
 	ns.localDiskSessions = newLocalDiskSessionStore(localDiskSessionRootPath)
 	return ns
@@ -277,16 +274,36 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		}
 	}
 
+	// Never format, fsck or mount a device that is mounted for something else.
+	if err := ns.refuseDeviceMountedElsewhere(devicePath, stagingTargetPath); err != nil {
+		klog.V(0).ErrorS(err, "Refusing a device that is already mounted elsewhere",
+			"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath, "stagingTargetPath", stagingTargetPath)
+		ns.recordPVCWarningFromPublishContext(ctx, volumeContext, eventReasonDeviceIdentityRefused, err.Error())
+		return nil, err
+	}
+
 	err = ns.mounter.FormatAndMount(devicePath, stagingTargetPath, fsType, mountFlags)
 	if err != nil {
-		if ns.deviceResolver != nil {
-			ns.deviceResolver.Invalidate(volumeID)
-		}
 		ns.recordLocalDeviceMountFailure(ctx, volumeID, volName, devicePath, stagingTargetPath, fsType, resolution, volumeContext, err)
 		klog.V(0).ErrorS(err, "Failed to format and mount volume",
 			"method", "NodeStageVolume", "devicePath", devicePath,
 			"stagingTargetPath", stagingTargetPath, "fsType", fsType)
+		if mountErrorSaysDeviceMounted(err, devicePath) {
+			return nil, status.Errorf(codes.FailedPrecondition, "refusing to stage %s at %s: the device is mounted elsewhere: %s", devicePath, stagingTargetPath, err)
+		}
 		return nil, status.Errorf(codes.Internal, "failed to format and mount volume: %s", err)
+	}
+	// mount-utils logs and ignores fsck's "is mounted"; check the mount table
+	// again so a device mounted elsewhere meanwhile is never left staged twice.
+	if err := ns.refuseDeviceMountedElsewhere(devicePath, stagingTargetPath); err != nil {
+		klog.V(0).ErrorS(err, "Device was mounted elsewhere during stage; unmounting the new stage",
+			"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath, "stagingTargetPath", stagingTargetPath)
+		if cleanupErr := mount.CleanupMountPoint(stagingTargetPath, ns.mounter.Interface, true); cleanupErr != nil {
+			klog.V(0).ErrorS(cleanupErr, "Failed to unmount the refused stage",
+				"method", "NodeStageVolume", "volumeID", volumeID, "stagingTargetPath", stagingTargetPath)
+		}
+		ns.recordPVCWarningFromPublishContext(ctx, volumeContext, eventReasonDeviceIdentityRefused, err.Error())
+		return nil, err
 	}
 
 	// The mount is left in place on a grow failure: kubelet retries NodeStage, which
@@ -325,9 +342,6 @@ func (ns *NodeServer) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageV
 	klog.V(3).InfoS("Cleaning staging target path volume mount point",
 		"method", "NodeUnstageVolume", "volumeID", volumeID, "stagingTargetPath", stagingTargetPath)
 
-	if ns.deviceResolver != nil {
-		ns.deviceResolver.Invalidate(volumeID)
-	}
 	ns.deleteLocalDiskSession(volumeID)
 
 	err := mount.CleanupMountPoint(stagingTargetPath, ns.mounter.Interface, true)
@@ -1051,10 +1065,6 @@ func (ns *NodeServer) NodeGetInfo(_ context.Context, req *csi.NodeGetInfoRequest
 	return response, nil
 }
 
-func (ns *NodeServer) getDeviceName(volumeName string) string {
-	return path.Join(defaultDiskPath, volumeName)
-}
-
 type deviceResolutionResult struct {
 	ResolvedBy string
 	// Proof is set for a request with a serial: how the device was proven to carry it.
@@ -1062,27 +1072,27 @@ type deviceResolutionResult struct {
 	Latency time.Duration
 }
 
-// requireSerialProof refuses a device for a request with a serial unless the
-// resolver proved its identity. Consumers trust this proof; they do not
+// requireSerialProof refuses a device unless the publish context names a serial
+// and the resolver proved the device carries it. A context with no serial is
+// refused too: there is nothing to prove. Consumers trust this proof; they do not
 // re-check identity themselves.
 // @gotcha: this is what makes a wrong-disk format or bind impossible. Never stage or
-// publish a serial request's device without it.
+// publish a device without it, and never let a missing serial pass.
 func requireSerialProof(publishContext map[string]string, devicePath string, resolution deviceResolutionResult) error {
 	serial := strings.TrimSpace(publishContext[publishContextDeviceSerial])
-	if serial == "" || resolution.Proof != "" {
+	if serial == "" {
+		return status.Errorf(codes.FailedPrecondition, "%v; refusing to format, mount or publish %s", errNoDeviceSerial, devicePath)
+	}
+	if resolution.Proof != "" {
 		return nil
 	}
 	return status.Errorf(codes.FailedPrecondition, "device %s was not proven to carry serial %s; refusing to format, mount or publish it", devicePath, serial)
 }
 
-func (ns *NodeServer) resolveDevicePath(volumeName string, timeout time.Duration) (string, deviceResolutionResult, error) {
-	return ns.resolveDevicePathWithContext(context.Background(), "", volumeName, nil, timeout)
-}
-
-// deviceResolutionFailureCode: a refusal (ambiguous serial, no resolver) is
-// FailedPrecondition; only a genuine not-found timeout is DeadlineExceeded.
+// deviceResolutionFailureCode: a refusal (no serial, ambiguous serial, no
+// resolver) is FailedPrecondition; only a genuine not-found timeout is DeadlineExceeded.
 func deviceResolutionFailureCode(err error) codes.Code {
-	if errors.Is(err, errSerialAmbiguous) || errors.Is(err, errNoDeviceResolver) {
+	if errors.Is(err, errNoDeviceSerial) || errors.Is(err, errSerialAmbiguous) || errors.Is(err, errNoDeviceResolver) {
 		return codes.FailedPrecondition
 	}
 	return codes.DeadlineExceeded
@@ -1104,57 +1114,18 @@ func (ns *NodeServer) recordDeviceResolutionFailure(ctx context.Context, volumeI
 	return code
 }
 
+// resolveDevicePathWithContext locates the publish context's serial through the
+// resolver. Without a serial, or without a resolver, it refuses: it never falls
+// back to the volumeName TARGET or its aliases.
 func (ns *NodeServer) resolveDevicePathWithContext(ctx context.Context, volumeID, volumeName string, publishContext map[string]string, timeout time.Duration) (string, deviceResolutionResult, error) {
-	if ns.deviceResolver != nil {
-		return ns.deviceResolver.Resolve(ctx, volumeID, volumeName, publishContext, timeout)
+	serial := strings.TrimSpace(publishContext[publishContextDeviceSerial])
+	if serial == "" {
+		return "", deviceResolutionResult{}, noDeviceSerialError(volumeID, volumeName)
 	}
-	if serial := strings.TrimSpace(publishContext[publishContextDeviceSerial]); serial != "" {
-		// Only the resolver can prove a serial; the alias below would guess.
+	if ns.deviceResolver == nil {
 		return "", deviceResolutionResult{}, fmt.Errorf("%w to locate serial %s for volume %q", errNoDeviceResolver, serial, volumeName)
 	}
-
-	started := time.Now()
-	candidates := ns.deviceCandidates(volumeName)
-	deadline := time.Now().Add(timeout)
-	var lastErr error
-	expected := ns.getDeviceName(volumeName)
-
-	for {
-		for _, candidate := range candidates {
-			if _, err := nodeVolumePathStat(candidate); err == nil {
-				result := deviceResolutionResult{
-					ResolvedBy: "exact",
-					Latency:    time.Since(started),
-				}
-				if candidate != expected {
-					result.ResolvedBy = "alias"
-					klog.V(2).InfoS("Resolved device path via alias",
-						"method", "resolveDevicePath", "volumeName", volumeName, "devicePath", candidate)
-				}
-				return candidate, result, nil
-			} else if !os.IsNotExist(err) {
-				lastErr = err
-			}
-		}
-
-		if time.Now().After(deadline) {
-			break
-		}
-
-		nodeDeviceSleep(defaultNodeDevicePollPeriod)
-	}
-
-	if lastErr != nil {
-		return "", deviceResolutionResult{}, fmt.Errorf(
-			"timed out after %s waiting for device path for volume %q (checked %s, last error: %v)",
-			timeout, volumeName, strings.Join(candidates, ", "), lastErr,
-		)
-	}
-
-	return "", deviceResolutionResult{}, fmt.Errorf(
-		"timed out after %s waiting for device path for volume %q (checked %s)",
-		timeout, volumeName, strings.Join(candidates, ", "),
-	)
+	return ns.deviceResolver.Resolve(ctx, volumeID, volumeName, publishContext, timeout)
 }
 
 func (ns *NodeServer) deviceDiscoveryTimeout(publishContext map[string]string) time.Duration {
@@ -1225,9 +1196,6 @@ func (ns *NodeServer) recordDeviceResolutionFromPublishContext(ctx context.Conte
 	}
 	ns.Driver.metrics.RecordNodeDeviceResolution(method, "success")
 	switch {
-	case strings.HasPrefix(method, "cache"):
-		ns.Driver.metrics.RecordDeviceCache("lookup", "hit")
-		ns.recordPVCEventFromPublishContext(ctx, publishContext, eventReasonDeviceCacheHit, fmt.Sprintf("resolved device using cache via %s", method))
 	case strings.Contains(method, "by-id"):
 		ns.Driver.metrics.RecordDeviceCache("lookup", "miss")
 		ns.recordPVCEventFromPublishContext(ctx, publishContext, eventReasonDeviceByIDResolved, fmt.Sprintf("resolved device using /dev/disk/by-id via %s", method))
@@ -1237,32 +1205,67 @@ func (ns *NodeServer) recordDeviceResolutionFromPublishContext(ctx context.Conte
 	}
 }
 
-func (ns *NodeServer) deviceCandidates(volumeName string) []string {
-	baseName := filepath.Base(volumeName)
-	names := []string{baseName}
-
-	switch {
-	case strings.HasPrefix(baseName, "sd"):
-		suffix := strings.TrimPrefix(baseName, "sd")
-		names = append(names, "vd"+suffix, "xvd"+suffix)
-	case strings.HasPrefix(baseName, "vd"):
-		suffix := strings.TrimPrefix(baseName, "vd")
-		names = append(names, "sd"+suffix, "xvd"+suffix)
-	case strings.HasPrefix(baseName, "xvd"):
-		suffix := strings.TrimPrefix(baseName, "xvd")
-		names = append(names, "vd"+suffix, "sd"+suffix)
+// refuseDeviceMountedElsewhere returns FailedPrecondition when devicePath is
+// mounted at any path other than stagingTargetPath. It reads the mount table
+// through the mounter, so a device counts as mounted whether it is a stage, a
+// pod's bind mount, or anything else.
+// @gotcha: checkMountPoint only asks "is THIS staging path mounted from THIS
+// device" (idempotency). It never saw a device already staged for another
+// volume, so a second stage mounted the same filesystem twice. Call this
+// before any format, fsck or mount of a resolved device.
+func (ns *NodeServer) refuseDeviceMountedElsewhere(devicePath, stagingTargetPath string) error {
+	mountPoints, err := ns.mounter.List()
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to list mount points to check %s: %v", devicePath, err)
 	}
-
-	candidates := make([]string, 0, len(names))
-	for _, name := range names {
-		candidate := ns.getDeviceName(name)
-		if slices.Contains(candidates, candidate) {
+	for _, mp := range mountPoints {
+		if mp.Device == "" || isSamePath(mp.Path, stagingTargetPath) {
 			continue
 		}
-		candidates = append(candidates, candidate)
+		if isSameDevice(mp.Device, devicePath) {
+			return status.Errorf(codes.FailedPrecondition,
+				"device %s is already mounted at %s; refusing to stage it at %s (another volume may own this disk)",
+				devicePath, mp.Path, stagingTargetPath)
+		}
 	}
+	return nil
+}
 
-	return candidates
+// isSameDevice compares a mount table source with a resolved device: the same
+// path, the same symlink target, or the same block device number.
+func isSameDevice(a, b string) bool {
+	if a == b {
+		return true
+	}
+	ra, errA := nodeEvalSymlinks(a)
+	rb, errB := nodeEvalSymlinks(b)
+	if errA == nil && errB == nil && ra == rb {
+		return true
+	}
+	return sameBlockDevice(a, b)
+}
+
+// isSamePath compares a mount table path with a requested path: equal after
+// filepath.Clean, or the same directory once symlinks are resolved (the mount
+// table shows resolved paths; kubelet may pass a symlinked one).
+func isSamePath(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	ra, errA := nodeEvalSymlinks(a)
+	rb, errB := nodeEvalSymlinks(b)
+	return errA == nil && errB == nil && ra == rb
+}
+
+// mountErrorSaysDeviceMounted reports whether a format/mount error says this
+// device is already mounted: mount's "<device> already mounted", fsck's
+// "<device> is mounted".
+func mountErrorSaysDeviceMounted(err error, devicePath string) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, devicePath+" already mounted") || strings.Contains(msg, devicePath+" is mounted")
 }
 
 func (ns *NodeServer) getMountedDevicePath(targetPath string) (string, error) {

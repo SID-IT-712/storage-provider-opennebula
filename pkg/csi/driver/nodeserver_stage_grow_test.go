@@ -50,7 +50,7 @@ func stageGrowRequest(staging string, capability *csi.VolumeCapability) *csi.Nod
 		VolumeId:          "vol-grow",
 		StagingTargetPath: staging,
 		VolumeCapability:  capability,
-		PublishContext:    map[string]string{"volumeName": "zero"},
+		PublishContext:    map[string]string{"volumeName": "zero", publishContextDeviceSerial: "onecsi-7"},
 	}
 }
 
@@ -63,8 +63,10 @@ func mountCapability(fsType string, mode csi.VolumeCapability_AccessMode_Mode) *
 
 func stageGrowDisk(t *testing.T) string {
 	t.Helper()
+	sysfs := withTestSysfs(t)
 	diskPath := withTestDiskPath(t)
 	require.NoError(t, os.WriteFile(filepath.Join(diskPath, "zero"), []byte("test"), 0o644))
+	writeSysfsVPD80(t, sysfs, "zero", vpdPage80("onecsi-7"))
 	return filepath.Join(diskPath, "zero")
 }
 
@@ -182,7 +184,7 @@ func TestLocalDiskRecoveryGrowsFilesystemSmallerThanDevice(t *testing.T) {
 	ns := getTestNodeServer(nil)
 	ns.Driver.featureGates.LocalRWOStaleMountRecovery = true
 	ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
-	session := localDiskSession{VolumeID: "vol-grow", VolumeName: "zero", StagingTargetPath: staging, FSType: "ext4"}
+	session := localDiskSession{VolumeID: "vol-grow", VolumeName: "zero", DeviceSerial: "onecsi-7", StagingTargetPath: staging, FSType: "ext4"}
 
 	require.NoError(t, ns.recoverLocalDiskSession(context.Background(), session, "test"))
 	assert.Equal(t, [][2]string{{device, staging}}, calls.resize)
@@ -194,9 +196,46 @@ func TestLocalDiskRecoveryFailsWhenGrowFails(t *testing.T) {
 	ns := getTestNodeServer(nil)
 	ns.Driver.featureGates.LocalRWOStaleMountRecovery = true
 	ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
-	session := localDiskSession{VolumeID: "vol-grow", VolumeName: "zero", StagingTargetPath: t.TempDir(), FSType: "xfs"}
+	session := localDiskSession{VolumeID: "vol-grow", VolumeName: "zero", DeviceSerial: "onecsi-7", StagingTargetPath: t.TempDir(), FSType: "xfs"}
 
 	err := ns.recoverLocalDiskSession(context.Background(), session, "test")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "xfs_growfs: exit status 1")
+}
+
+// Recovery inherits the fail-closed rules: a session recorded without a serial
+// is never re-staged by target name, and a recovered device that is mounted for
+// something else is never mounted again.
+func TestLocalDiskRecoveryRefusesUnprovenOrBusyDevice(t *testing.T) {
+	t.Run("session without serial", func(t *testing.T) {
+		stageGrowDisk(t)
+		stubStageGrow(t, false, nil, nil)
+		ns := getTestNodeServer(nil)
+		ns.Driver.featureGates.LocalRWOStaleMountRecovery = true
+		ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
+		session := localDiskSession{VolumeID: "vol-grow", VolumeName: "zero", StagingTargetPath: t.TempDir(), FSType: "ext4"}
+
+		err := ns.recoverLocalDiskSession(context.Background(), session, "test")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, errNoDeviceSerial)
+		assert.Empty(t, ns.mounter.Interface.(*mount.FakeMounter).GetLog())
+	})
+
+	t.Run("device mounted elsewhere", func(t *testing.T) {
+		device := stageGrowDisk(t)
+		stubStageGrow(t, false, nil, nil)
+		ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Device: device, Path: "/other/globalmount", Type: "ext4"}})
+		ns.Driver.featureGates.LocalRWOStaleMountRecovery = true
+		ns.localDiskSessions = newLocalDiskSessionStore(t.TempDir())
+		staging := t.TempDir()
+		session := localDiskSession{VolumeID: "vol-grow", VolumeName: "zero", DeviceSerial: "onecsi-7", StagingTargetPath: staging, FSType: "ext4"}
+
+		err := ns.recoverLocalDiskSession(context.Background(), session, "test")
+		require.Error(t, err)
+		assert.Equal(t, codes.FailedPrecondition, status.Code(err), "err: %v", err)
+		assert.Contains(t, err.Error(), "/other/globalmount")
+		for _, mp := range ns.mounter.Interface.(*mount.FakeMounter).MountPoints {
+			assert.NotEqual(t, staging, mp.Path, "nothing is mounted at the stage")
+		}
+	})
 }
