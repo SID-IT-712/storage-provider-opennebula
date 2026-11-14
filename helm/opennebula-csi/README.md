@@ -359,8 +359,6 @@ One of `credentials.existingSecret.name` or `credentials.inlineAuth` must be set
 | `driver.nodeExpand.verifyTimeoutSeconds` | Maximum time for node-side resize convergence before returning `DeadlineExceeded`. | `120` | No |
 | `driver.nodeExpand.retryIntervalSeconds` | Retry interval for node-side checks between device visibility, growfs execution, and filesystem size validation. | `2` | No |
 | `driver.nodeExpand.sizeToleranceBytes` | Allowed slack between requested and observed filesystem size to account for filesystem metadata overhead. | `134217728` | No |
-| `driver.nodeDeviceCache.enabled` | Enable node-local device cache and stable serial/by-id resolution. | `true` | No |
-| `driver.nodeDeviceCache.ttlSeconds` | Cache TTL for confirmed device paths. | `600` | No |
 | `driver.nodeDeviceCache.udevSettleTimeoutSeconds` | Timeout for `udevadm settle` before device rescan on miss. | `10` | No |
 | `driver.nodeDeviceCache.rescanOnMissEnabled` | Allow SCSI host rescan when device resolution misses. | `true` | No |
 | `driver.hotplugQueue.enabled` | Queue same-node hotplug work instead of failing fast on lock contention. | `true` | No |

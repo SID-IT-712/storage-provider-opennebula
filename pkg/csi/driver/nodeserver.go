@@ -18,11 +18,13 @@ package driver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -275,7 +277,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 
 	// Never format, fsck or mount a device that is mounted for something else.
-	if err := ns.refuseDeviceMountedElsewhere(devicePath, stagingTargetPath); err != nil {
+	if err := ns.refuseDeviceMountedElsewhere(devicePath, stagingTargetPath, volumeID, strings.TrimSpace(volumeContext[paramPVName])); err != nil {
 		klog.V(0).ErrorS(err, "Refusing a device that is already mounted elsewhere",
 			"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath, "stagingTargetPath", stagingTargetPath)
 		ns.recordPVCWarningFromPublishContext(ctx, volumeContext, eventReasonDeviceIdentityRefused, err.Error())
@@ -295,7 +297,7 @@ func (ns *NodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	}
 	// mount-utils logs and ignores fsck's "is mounted"; check the mount table
 	// again so a device mounted elsewhere meanwhile is never left staged twice.
-	if err := ns.refuseDeviceMountedElsewhere(devicePath, stagingTargetPath); err != nil {
+	if err := ns.refuseDeviceMountedElsewhere(devicePath, stagingTargetPath, volumeID, strings.TrimSpace(volumeContext[paramPVName])); err != nil {
 		klog.V(0).ErrorS(err, "Device was mounted elsewhere during stage; unmounting the new stage",
 			"method", "NodeStageVolume", "volumeID", volumeID, "devicePath", devicePath, "stagingTargetPath", stagingTargetPath)
 		if cleanupErr := mount.CleanupMountPoint(stagingTargetPath, ns.mounter.Interface, true); cleanupErr != nil {
@@ -1197,38 +1199,73 @@ func (ns *NodeServer) recordDeviceResolutionFromPublishContext(ctx context.Conte
 	ns.Driver.metrics.RecordNodeDeviceResolution(method, "success")
 	switch {
 	case strings.Contains(method, "by-id"):
-		ns.Driver.metrics.RecordDeviceCache("lookup", "miss")
 		ns.recordPVCEventFromPublishContext(ctx, publishContext, eventReasonDeviceByIDResolved, fmt.Sprintf("resolved device using /dev/disk/by-id via %s", method))
 	default:
-		ns.Driver.metrics.RecordDeviceCache("lookup", "miss")
-		ns.recordPVCEventFromPublishContext(ctx, publishContext, eventReasonDeviceCacheMiss, fmt.Sprintf("resolved device after cache miss via %s", method))
+		ns.recordPVCEventFromPublishContext(ctx, publishContext, eventReasonDeviceSerialResolved, fmt.Sprintf("resolved device by its kernel serial via %s", method))
 	}
 }
 
 // refuseDeviceMountedElsewhere returns FailedPrecondition when devicePath is
-// mounted at any path other than stagingTargetPath. It reads the mount table
-// through the mounter, so a device counts as mounted whether it is a stage, a
-// pod's bind mount, or anything else.
+// mounted at a path other than stagingTargetPath that does not belong to this
+// volume. It reads the mount table through the mounter, so a device counts as
+// mounted whether it is a stage, a pod's bind mount, or anything else. Each
+// such mount is attributed (mountBelongsToVolume): this volume's own pod bind
+// mounts and staging dirs are allowed; another volume's, and any mount that
+// cannot be attributed, are refused (fail closed).
 // @gotcha: checkMountPoint only asks "is THIS staging path mounted from THIS
 // device" (idempotency). It never saw a device already staged for another
 // volume, so a second stage mounted the same filesystem twice. Call this
 // before any format, fsck or mount of a resolved device.
-func (ns *NodeServer) refuseDeviceMountedElsewhere(devicePath, stagingTargetPath string) error {
+func (ns *NodeServer) refuseDeviceMountedElsewhere(devicePath, stagingTargetPath, volumeID, pvName string) error {
 	mountPoints, err := ns.mounter.List()
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to list mount points to check %s: %v", devicePath, err)
 	}
 	for _, mp := range mountPoints {
-		if mp.Device == "" || isSamePath(mp.Path, stagingTargetPath) {
+		if mp.Device == "" || isSamePath(mp.Path, stagingTargetPath) || !isSameDevice(mp.Device, devicePath) {
 			continue
 		}
-		if isSameDevice(mp.Device, devicePath) {
-			return status.Errorf(codes.FailedPrecondition,
-				"device %s is already mounted at %s; refusing to stage it at %s (another volume may own this disk)",
-				devicePath, mp.Path, stagingTargetPath)
+		owner, attributed := mountOwner(mp.Path)
+		if attributed && (owner == volumeID || (pvName != "" && owner == pvName)) {
+			continue
 		}
+		if !attributed {
+			owner = "an unknown owner"
+		}
+		return status.Errorf(codes.FailedPrecondition,
+			"device %s is already mounted at %s (%s, not volume %s); refusing to stage it at %s",
+			devicePath, mp.Path, owner, volumeID, stagingTargetPath)
 	}
 	return nil
+}
+
+// kubeletCSIPodTarget matches a kubelet CSI pod publish target and captures
+// the PV name: .../pods/<uid>/volumes/kubernetes.io~csi/<pv>/mount
+var kubeletCSIPodTarget = regexp.MustCompile(`/pods/[^/]+/volumes/kubernetes\.io~csi/([^/]+)/mount/?$`)
+
+// mountOwner attributes a mount path to a volume: a kubelet pod target names
+// its PV in the path; a staging dir (<dir>/globalmount) has kubelet's
+// vol_data.json beside it naming the volume handle. Anything else, or an
+// unreadable vol_data.json, is unattributable.
+func mountOwner(mountPath string) (string, bool) {
+	if m := kubeletCSIPodTarget.FindStringSubmatch(mountPath); m != nil {
+		return m[1], true
+	}
+	clean := filepath.Clean(mountPath)
+	if filepath.Base(clean) != "globalmount" {
+		return "", false
+	}
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(clean), "vol_data.json"))
+	if err != nil {
+		return "", false
+	}
+	var data struct {
+		VolumeHandle string `json:"volumeHandle"`
+	}
+	if err := json.Unmarshal(raw, &data); err != nil || strings.TrimSpace(data.VolumeHandle) == "" {
+		return "", false
+	}
+	return strings.TrimSpace(data.VolumeHandle), true
 }
 
 // isSameDevice compares a mount table source with a resolved device: the same
@@ -1279,7 +1316,7 @@ func (ns *NodeServer) getMountedDevicePath(targetPath string) (string, error) {
 	}
 
 	for _, mountPoint := range mountPoints {
-		if mountPoint.Path == targetPath {
+		if isSamePath(mountPoint.Path, targetPath) {
 			if mountPoint.Device == "" {
 				return "", fmt.Errorf("mount point %s does not expose a backing device", targetPath)
 			}
@@ -1307,7 +1344,7 @@ func (ns *NodeServer) checkMountPoint(srcPath string, targetPath string, volumeC
 
 	foundMountPoint := mount.MountPoint{}
 	for _, mp := range mountPoints {
-		if mp.Path == targetPath {
+		if isSamePath(mp.Path, targetPath) {
 			foundMountPoint = mp
 			klog.V(5).InfoS("Found mount point matching target path",
 				"method", "checkMountPoint", "srcPath", srcPath, "targetPath", targetPath,
@@ -1318,7 +1355,7 @@ func (ns *NodeServer) checkMountPoint(srcPath string, targetPath string, volumeC
 
 	if !reflect.ValueOf(foundMountPoint).IsZero() {
 		mountPointMatch.targetIsMountPoint = true
-		if foundMountPoint.Device == srcPath {
+		if isSameDevice(foundMountPoint.Device, srcPath) {
 			mountPointMatch.deviceIsMounted = true
 		}
 	}

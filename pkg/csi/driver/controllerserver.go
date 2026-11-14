@@ -785,7 +785,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		s.clearHostArtifactQuarantineForVolume(ctx, req.VolumeId)
 		s.clearStickyReuseState(ctx, req.VolumeId, req.NodeId, "disk")
 		s.annotateRestartOptimizationForVolume(ctx, req.VolumeId, req.NodeId)
-		publishContext, contextErr := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
+		publishContext, contextErr := s.publishContextForVolume(ctx, req.VolumeId, volumeID, target, 0, req.GetVolumeContext())
 		if contextErr != nil {
 			s.driver.metrics.RecordOperation("controller_publish_volume", "disk", "unavailable", time.Since(started))
 			s.driver.metrics.RecordControllerPublishDuration("disk", "unavailable", time.Since(started))
@@ -843,7 +843,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 			s.clearHostArtifactQuarantineForVolume(queueCtx, req.VolumeId)
 			s.clearStickyReuseState(queueCtx, req.VolumeId, req.NodeId, "disk")
 			s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
-			publishContext, contextErr := s.publishContextForVolume(queueCtx, req.VolumeId, target, 0, req.GetVolumeContext())
+			publishContext, contextErr := s.publishContextForVolume(queueCtx, req.VolumeId, volumeID, target, 0, req.GetVolumeContext())
 			if contextErr != nil {
 				return contextErr
 			}
@@ -905,7 +905,7 @@ func (s *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi
 		s.annotateRestartOptimizationForVolume(queueCtx, req.VolumeId, req.NodeId)
 		// On failure the disk stays attached in OpenNebula. The attacher retries,
 		// GetVolumeInNode finds the disk, and the retry only builds the context.
-		publishContext, contextErr := s.publishContextForVolume(queueCtx, req.VolumeId, target, deviceDiscoveryTimeout, req.GetVolumeContext())
+		publishContext, contextErr := s.publishContextForVolume(queueCtx, req.VolumeId, volumeID, target, deviceDiscoveryTimeout, req.GetVolumeContext())
 		if contextErr != nil {
 			return contextErr
 		}
@@ -1570,24 +1570,22 @@ func (s *ControllerServer) formatHotplugGuardMessage(state opennebula.HotplugCoo
 	)
 }
 
-// publishContextForVolume builds the publish context of an attached disk. It
-// never returns a context without deviceSerial: when the OpenNebula image (and so
-// the disk's serial onecsi-<imageID>) cannot be determined, it returns a
-// retryable Unavailable error instead.
+// publishContextForVolume builds the publish context of an attached disk from
+// the image id the caller already resolved (the disk's serial is
+// onecsi-<imageID>, set at attach). It never returns a context without
+// deviceSerial: an invalid image id is a retryable Unavailable error instead.
 // @gotcha: without deviceSerial the node has only volumeName, OpenNebula's disk
 // TARGET, which is not the guest's kernel name; /dev/<TARGET> can be another
 // volume's disk. A context without the serial once mounted one volume's disk
-// for another. Never "degrade" this to omitting the serial.
-func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID, target string, deviceDiscoveryTimeout time.Duration, sourceContext map[string]string) (map[string]string, error) {
-	opennebulaImageID, _, imageIDErr := s.volumeProvider.VolumeExists(ctx, volumeID)
-	if imageIDErr != nil || opennebulaImageID < 0 {
-		if imageIDErr == nil {
-			imageIDErr = errors.New("image not found")
-		}
-		klog.V(0).ErrorS(imageIDErr, "Cannot determine the OpenNebula image of an attached volume; refusing to publish without deviceSerial",
+// for another, after a second image lookup here failed and the serial was
+// dropped. Never re-add that lookup, and never "degrade" to omitting the serial.
+func (s *ControllerServer) publishContextForVolume(ctx context.Context, volumeID string, opennebulaImageID int, target string, deviceDiscoveryTimeout time.Duration, sourceContext map[string]string) (map[string]string, error) {
+	if opennebulaImageID < 0 {
+		err := fmt.Errorf("invalid OpenNebula image id %d", opennebulaImageID)
+		klog.V(0).ErrorS(err, "Cannot build deviceSerial for an attached volume; refusing to publish without it",
 			"method", "publishContextForVolume", "volumeID", volumeID, "target", target)
 		return nil, status.Errorf(codes.Unavailable,
-			"cannot determine the OpenNebula image of volume %s to set deviceSerial (%v); refusing to publish without it, retry", volumeID, imageIDErr)
+			"cannot set deviceSerial for volume %s (%v); refusing to publish without it, retry", volumeID, err)
 	}
 
 	publishContext := map[string]string{
@@ -2221,7 +2219,7 @@ func (s *ControllerServer) reuseStickyAttachment(ctx context.Context, req *csi.C
 			return false, nil, nil
 		}
 		// Built before the sticky state is cleared, so a failed publish keeps it for the retry.
-		publishContext, contextErr := s.publishContextForVolume(ctx, req.VolumeId, target, 0, req.GetVolumeContext())
+		publishContext, contextErr := s.publishContextForVolume(ctx, req.VolumeId, volumeID, target, 0, req.GetVolumeContext())
 		if contextErr != nil {
 			return true, nil, contextErr
 		}

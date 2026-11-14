@@ -266,11 +266,11 @@ func TestRefuseDeviceMountedElsewhereMatchesStagingPathSpellings(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Device: own, Path: mountedPath, Type: "ext4"}})
-			assert.NoError(t, ns.refuseDeviceMountedElsewhere(own, linkDir))
+			assert.NoError(t, ns.refuseDeviceMountedElsewhere(own, linkDir, "vol-2936", ""))
 		})
 	}
 	ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Device: own, Path: "/other/globalmount", Type: "ext4"}})
-	assert.Equal(t, codes.FailedPrecondition, status.Code(ns.refuseDeviceMountedElsewhere(own, linkDir)))
+	assert.Equal(t, codes.FailedPrecondition, status.Code(ns.refuseDeviceMountedElsewhere(own, linkDir, "vol-2936", "")))
 }
 
 func TestMountErrorSaysDeviceMounted(t *testing.T) {
@@ -279,6 +279,88 @@ func TestMountErrorSaysDeviceMounted(t *testing.T) {
 	assert.False(t, mountErrorSaysDeviceMounted(errors.New("mount: /stage: filesystem is mounted read-only"), "/dev/sdac"))
 	assert.False(t, mountErrorSaysDeviceMounted(errors.New("can't read superblock"), "/dev/sdac"))
 	assert.False(t, mountErrorSaysDeviceMounted(nil, "/dev/sdac"))
+}
+
+// QA hole 1: kubelet passes a symlinked spelling of a staging path that is
+// already staged, while a pod bind mount of this volume exists. That is the
+// idempotent re-stage, not a refusal.
+func TestStageVolumeIdempotentWithSymlinkedStagingAndPodBind(t *testing.T) {
+	_, own, _ := incidentDisks(t)
+	stubStageGrow(t, false, nil, nil)
+	realStaging := t.TempDir()
+	link := filepath.Join(t.TempDir(), "kubelet-link")
+	require.NoError(t, os.Symlink(realStaging, link))
+	podTarget := "/var/lib/kubelet/pods/uid1/volumes/kubernetes.io~csi/pv-a/mount"
+	ns := getTestNodeServerWithMountPoints([]mount.MountPoint{
+		{Device: own, Path: realStaging, Type: "ext4"},
+		{Device: own, Path: podTarget, Type: "ext4"},
+	})
+	fm := ns.mounter.Interface.(*mount.FakeMounter)
+
+	_, err := ns.NodeStageVolume(context.Background(), incidentStageRequest(link, true))
+
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{realStaging, podTarget}, mountedAt(fm, own), "nothing new is mounted")
+}
+
+// writeStagingDir lays out a kubelet staging dir: <dir>/globalmount plus the
+// vol_data.json kubelet writes beside it, naming the volume handle.
+func writeStagingDir(t *testing.T, volumeHandle string) string {
+	t.Helper()
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "globalmount"), 0o755))
+	if volumeHandle != "" {
+		data, err := json.Marshal(map[string]string{"volumeHandle": volumeHandle, "driverName": DefaultDriverName})
+		require.NoError(t, err)
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "vol_data.json"), data, 0o644))
+	}
+	return filepath.Join(dir, "globalmount")
+}
+
+// QA hole 2 and its siblings: before refusing a device mounted elsewhere, each
+// mount is attributed to a volume. This volume's own mounts are allowed;
+// another volume's, and anything that cannot be attributed, are refused.
+func TestStageVolumeAttributesMountsOfTheDevice(t *testing.T) {
+	ownPodTarget := "/var/lib/kubelet/pods/uid1/volumes/kubernetes.io~csi/pv-a/mount"
+	handlePodTarget := "/var/lib/kubelet/pods/uid1/volumes/kubernetes.io~csi/vol-2936/mount"
+	otherPodTarget := "/var/lib/kubelet/pods/uid2/volumes/kubernetes.io~csi/pv-b/mount"
+
+	tcs := []struct {
+		name       string
+		mountPath  func(t *testing.T) string
+		expectCode codes.Code
+	}{
+		{"own pod bind mount (PV name from the publish context)", func(*testing.T) string { return ownPodTarget }, codes.OK},
+		{"own pod bind mount (PV named like the volume handle)", func(*testing.T) string { return handlePodTarget }, codes.OK},
+		{"own staging dir elsewhere (vol_data.json names this volume)", func(t *testing.T) string { return writeStagingDir(t, "vol-2936") }, codes.OK},
+		{"another volume's pod bind mount", func(*testing.T) string { return otherPodTarget }, codes.FailedPrecondition},
+		{"another volume's staging dir", func(t *testing.T) string { return writeStagingDir(t, "vol-2690") }, codes.FailedPrecondition},
+		{"staging dir without vol_data.json (unattributable)", func(t *testing.T) string { return writeStagingDir(t, "") }, codes.FailedPrecondition},
+		{"any other path (unattributable)", func(*testing.T) string { return "/mnt/manual" }, codes.FailedPrecondition},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			_, own, _ := incidentDisks(t)
+			stubStageGrow(t, false, nil, nil)
+			staging := t.TempDir()
+			elsewhere := tc.mountPath(t)
+			ns := getTestNodeServerWithMountPoints([]mount.MountPoint{{Device: own, Path: elsewhere, Type: "ext4"}})
+			fm := ns.mounter.Interface.(*mount.FakeMounter)
+			req := incidentStageRequest(staging, true)
+			req.PublishContext[paramPVName] = "pv-a"
+
+			_, err := ns.NodeStageVolume(context.Background(), req)
+
+			assert.Equal(t, tc.expectCode, status.Code(err), "err: %v", err)
+			if tc.expectCode == codes.OK {
+				assert.ElementsMatch(t, []string{elsewhere, staging}, mountedAt(fm, own))
+				return
+			}
+			assert.Contains(t, err.Error(), elsewhere)
+			assert.Contains(t, err.Error(), staging)
+			assert.Equal(t, []string{elsewhere}, mountedAt(fm, own), "nothing new is mounted")
+		})
+	}
 }
 
 // raceMounter mounts like the fake, then reports the device as also mounted

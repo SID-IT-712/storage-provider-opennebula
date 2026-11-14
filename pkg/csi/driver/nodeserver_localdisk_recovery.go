@@ -345,7 +345,7 @@ func (ns *NodeServer) recoverLocalDiskSession(ctx context.Context, session local
 	if fsType == "" {
 		fsType = defaultFSType
 	}
-	if err := ns.refuseDeviceMountedElsewhere(devicePath, session.StagingTargetPath); err != nil {
+	if err := ns.refuseDeviceMountedElsewhere(devicePath, session.StagingTargetPath, session.VolumeID, session.PVName); err != nil {
 		return ns.recordLocalDiskRecoveryFailure(session, err)
 	}
 	if err := ns.mounter.FormatAndMount(devicePath, session.StagingTargetPath, fsType, session.StageMountOptions); err != nil {
@@ -501,7 +501,7 @@ func (ns *NodeServer) mountPointForPath(path string) (mount.MountPoint, bool, er
 		return mount.MountPoint{}, false, err
 	}
 	for _, mountPoint := range mountPoints {
-		if mountPoint.Path == path {
+		if isSamePath(mountPoint.Path, path) {
 			return mountPoint, true, nil
 		}
 	}

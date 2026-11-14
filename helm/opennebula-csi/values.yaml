@@ -35,8 +35,6 @@ driver:
     retryIntervalSeconds: 2
     sizeToleranceBytes: 134217728
   nodeDeviceCache:
-    enabled: true
-    ttlSeconds: 600
     udevSettleTimeoutSeconds: 10
     rescanOnMissEnabled: true
   hotplugQueue:
